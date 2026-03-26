@@ -7,3 +7,5 @@ langgraph-checkpoint-postgres
 psycopg[binary]
 snowflake-connector-python
 faiss-cpu
+fastapi
+uvicorn
