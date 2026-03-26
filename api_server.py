@@ -5,6 +5,8 @@ import re
 import sqlite3
 import sys
 import uuid
+import json
+import hashlib
 from importlib import import_module
 from datetime import UTC, datetime
 from typing import Any, Optional
@@ -47,6 +49,8 @@ class ChatResponse(BaseModel):
     relevant_questions: Optional[list[str]] = None
     sql_result: Optional[dict[str, Any]] = None
     visualization_code: Optional[str] = None
+    visualization_figure: Optional[dict[str, Any]] = None
+    visualization_meta: Optional[dict[str, Any]] = None
 
 
 class VoteRequest(BaseModel):
@@ -149,6 +153,179 @@ def _parse_agent_output(text: str) -> dict[str, Optional[str]]:
             sections[key] = match.group(1).strip()
 
     return sections
+
+
+def _strip_code_fences(code: str) -> str:
+    stripped = code.strip()
+    stripped = re.sub(r"^```(?:python)?\s*", "", stripped, flags=re.IGNORECASE)
+    stripped = re.sub(r"\s*```$", "", stripped)
+    return stripped.strip()
+
+
+def _normalize_visualization_code(code: str) -> str:
+    lines = code.splitlines()
+    cleaned_lines: list[str] = []
+
+    for line in lines:
+        stripped = line.strip()
+        lowered = stripped.lower()
+
+        # Imports are unnecessary because modules are pre-injected.
+        if lowered.startswith("import ") or lowered.startswith("from "):
+            continue
+
+        # Never execute rendering side effects in backend.
+        if lowered in {"fig.show()", "plt.show()"}:
+            continue
+
+        cleaned_lines.append(line)
+
+    return "\n".join(cleaned_lines).strip()
+
+
+def _json_safe(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(item) for item in value]
+
+    # Handles numpy arrays/scalars and pandas extension values.
+    if hasattr(value, "tolist"):
+        try:
+            return _json_safe(value.tolist())
+        except Exception:
+            pass
+
+    if hasattr(value, "item"):
+        try:
+            return _json_safe(value.item())
+        except Exception:
+            pass
+
+    return str(value)
+
+
+def _stable_hash(value: Any) -> str:
+    canonical = json.dumps(_json_safe(value), sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _build_plotly_figure_json(
+    visualization_code: Optional[str],
+    sql_result: Optional[dict[str, Any]],
+) -> Optional[dict[str, Any]]:
+    if not visualization_code or not sql_result:
+        return None
+
+    raw_code = visualization_code.strip()
+    if not raw_code or raw_code.upper() == "NO_VISUALIZATION":
+        return None
+
+    rows = sql_result.get("data")
+    if not isinstance(rows, list):
+        return None
+    columns = sql_result.get("columns")
+
+    code = _normalize_visualization_code(_strip_code_fences(raw_code))
+    if not code:
+        return None
+
+    try:
+        pandas_module = import_module("pandas")
+        px_module = import_module("plotly.express")
+        go_module = import_module("plotly.graph_objects")
+        subplots_module = import_module("plotly.subplots")
+    except Exception:
+        return None
+
+    DataFrame = getattr(pandas_module, "DataFrame", None)
+    make_subplots = getattr(subplots_module, "make_subplots", None)
+    if DataFrame is None or make_subplots is None:
+        return None
+
+    if isinstance(columns, list) and columns:
+        df = DataFrame(rows, columns=columns)
+    else:
+        df = DataFrame(rows)
+
+    safe_builtins = {
+        "abs": abs,
+        "dict": dict,
+        "enumerate": enumerate,
+        "float": float,
+        "int": int,
+        "bool": bool,
+        "all": all,
+        "any": any,
+        "isinstance": isinstance,
+        "len": len,
+        "list": list,
+        "map": map,
+        "max": max,
+        "min": min,
+        "range": range,
+        "round": round,
+        "set": set,
+        "sorted": sorted,
+        "str": str,
+        "sum": sum,
+        "tuple": tuple,
+        "zip": zip,
+    }
+    safe_globals: dict[str, Any] = {
+        "__builtins__": safe_builtins,
+        "df": df,
+        "dataframe": df,
+        "result_df": df,
+        "query_result_df": df,
+        "pd": pandas_module,
+        "px": px_module,
+        "go": go_module,
+        "make_subplots": make_subplots,
+    }
+    safe_locals: dict[str, Any] = {}
+
+    try:
+        exec(code, safe_globals, safe_locals)
+    except Exception:
+        return None
+
+    fig = safe_locals.get("fig") or safe_globals.get("fig")
+    if fig is None or not hasattr(fig, "to_plotly_json"):
+        return None
+
+    try:
+        figure_json = fig.to_plotly_json()
+        if not isinstance(figure_json, dict):
+            return None
+    except Exception:
+        return None
+
+    config = figure_json.get("config")
+    if not isinstance(config, dict):
+        config = {}
+
+    figure_json["config"] = {
+        "displaylogo": False,
+        "responsive": True,
+        **config,
+    }
+    try:
+        plotly_utils = import_module("plotly.utils")
+        plotly_json_encoder = getattr(plotly_utils, "PlotlyJSONEncoder", None)
+
+        if plotly_json_encoder is not None:
+            # Preserve dates/timestamps in Plotly-native JSON format.
+            return json.loads(json.dumps(figure_json, cls=plotly_json_encoder))
+
+        # Fallback when Plotly encoder is unavailable.
+        return json.loads(json.dumps(_json_safe(figure_json)))
+    except Exception:
+        return None
 
 
 def _feedback_exists(thread_id: str, message_id: str) -> bool:
@@ -287,6 +464,21 @@ def _serialize_thread_messages(chatbot_instance: Any, thread_id: str) -> list[di
     messages = state.values.get("messages", [])
 
     serialized: list[dict[str, Any]] = []
+    last_assistant_index: Optional[int] = None
+
+    def _append_assistant_data_part(part: dict[str, Any]) -> None:
+        if last_assistant_index is None:
+            return
+        serialized[last_assistant_index]["parts"].append(part)
+
+    def _get_assistant_sql_result() -> Optional[dict[str, Any]]:
+        if last_assistant_index is None:
+            return None
+        for part in serialized[last_assistant_index].get("parts", []):
+            if part.get("type") == "data-sqlResult" and isinstance(part.get("data"), dict):
+                return part["data"]
+        return None
+
     for message in messages:
         msg_type = getattr(message, "type", None)
         if msg_type in {"human", "HumanMessage"}:
@@ -298,19 +490,118 @@ def _serialize_thread_messages(chatbot_instance: Any, thread_id: str) -> list[di
         else:
             continue
 
+        additional_kwargs = getattr(message, "additional_kwargs", {}) or {}
+
+        if role == "assistant" and isinstance(additional_kwargs, dict):
+            structured_type = additional_kwargs.get("type")
+
+            if structured_type == "sql_result":
+                raw_data = additional_kwargs.get("data")
+                if isinstance(raw_data, dict):
+                    _append_assistant_data_part({"type": "data-sqlResult", "data": raw_data})
+
+                    raw_columns = raw_data.get("columns")
+                    if isinstance(raw_columns, list) and raw_columns:
+                        _append_assistant_data_part(
+                            {"type": "data-sqlColumns", "data": [str(column) for column in raw_columns]}
+                        )
+
+                    raw_rows = raw_data.get("data")
+                    if isinstance(raw_rows, list):
+                        _append_assistant_data_part(
+                            {"type": "data-sqlRowCount", "data": len(raw_rows)}
+                        )
+                continue
+
+            if structured_type == "visualization":
+                raw_code = additional_kwargs.get("code")
+                if isinstance(raw_code, str):
+                    _append_assistant_data_part({"type": "data-visualizationCode", "data": raw_code})
+
+                    figure_json = _build_plotly_figure_json(raw_code, _get_assistant_sql_result())
+                    if isinstance(figure_json, dict) and figure_json.get("data"):
+                        _append_assistant_data_part(
+                            {"type": "data-visualizationFigure", "data": figure_json}
+                        )
+
+                    meta_json = _build_visualization_meta(
+                        _get_assistant_sql_result(),
+                        raw_code,
+                        figure_json,
+                    )
+                    if isinstance(meta_json, dict):
+                        _append_assistant_data_part(
+                            {"type": "data-visualizationMeta", "data": meta_json}
+                        )
+                continue
+
         content = _extract_text_from_content(getattr(message, "content", ""))
         if not content.strip():
             continue
+
+        parts: list[dict[str, Any]] = [{"type": "text", "text": content}]
+
+        if role == "assistant":
+            parsed_sections = _parse_agent_output(content)
+
+            if parsed_sections.get("sql_query"):
+                parts.append({"type": "data-sqlQuery", "data": parsed_sections["sql_query"]})
+
+            if parsed_sections.get("result_summary"):
+                parts.append({"type": "data-resultSummary", "data": parsed_sections["result_summary"]})
+
+            if parsed_sections.get("relevant_questions"):
+                relevant_questions = [
+                    line.strip().lstrip("-").strip()
+                    for line in parsed_sections["relevant_questions"].splitlines()
+                    if line.strip()
+                ]
+                if relevant_questions:
+                    parts.append({"type": "data-relevantQuestions", "data": relevant_questions})
 
         serialized.append(
             {
                 "id": str(uuid.uuid4()),
                 "role": role,
-                "parts": [{"type": "text", "text": content}],
+                "parts": parts,
             }
         )
 
+        if role == "assistant":
+            last_assistant_index = len(serialized) - 1
+        else:
+            last_assistant_index = None
+
     return serialized
+
+
+def _build_visualization_meta(
+    sql_result: Optional[dict[str, Any]],
+    visualization_code: Optional[str],
+    visualization_figure: Optional[dict[str, Any]],
+) -> Optional[dict[str, Any]]:
+    if not sql_result:
+        return None
+
+    rows = sql_result.get("data")
+    columns = sql_result.get("columns")
+    if not isinstance(rows, list):
+        return None
+
+    safe_columns = [str(c) for c in columns] if isinstance(columns, list) else []
+    trace_count = 0
+    if isinstance(visualization_figure, dict) and isinstance(visualization_figure.get("data"), list):
+        trace_count = len(visualization_figure.get("data") or [])
+
+    return {
+        "source": "sql_result_dataframe",
+        "source_row_count": len(rows),
+        "source_column_count": len(safe_columns),
+        "source_columns": safe_columns,
+        "source_data_sha256": _stable_hash(rows),
+        "visualization_code_sha256": _stable_hash(visualization_code or ""),
+        "plotly_trace_count": trace_count,
+    }
 
 
 @app.get("/health")
@@ -387,6 +678,8 @@ def chat(request: ChatRequest) -> ChatResponse:
 
     assistant_text = assistant_text or "Completed"
     parsed_sections = _parse_agent_output(assistant_text)
+    visualization_figure = _build_plotly_figure_json(visualization_code, sql_result)
+    visualization_meta = _build_visualization_meta(sql_result, visualization_code, visualization_figure)
 
     relevant_questions: Optional[list[str]] = None
     if parsed_sections["relevant_questions"]:
@@ -404,6 +697,8 @@ def chat(request: ChatRequest) -> ChatResponse:
         relevant_questions=relevant_questions,
         sql_result=sql_result,
         visualization_code=visualization_code,
+        visualization_figure=visualization_figure,
+        visualization_meta=visualization_meta,
     )
 
 

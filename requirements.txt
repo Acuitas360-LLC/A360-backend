@@ -9,3 +9,5 @@ snowflake-connector-python
 faiss-cpu
 fastapi
 uvicorn
+pandas
+plotly
