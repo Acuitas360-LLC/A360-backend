@@ -6,14 +6,20 @@ import sqlite3
 import sys
 import uuid
 import json
-import hashlib
+import asyncio
+import csv
 from importlib import import_module
 from datetime import UTC, datetime
 from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 # Support legacy absolute imports used across backend modules.
 BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -24,7 +30,8 @@ if BACKEND_DIR not in sys.path:
 os.chdir(BACKEND_DIR)
 load_dotenv(os.path.join(BACKEND_DIR, ".env"))
 
-from chatbot7 import build_chatbot
+from chatbot7 import build_chatbot, build_rag_examples
+from subgraph5 import build_graph as build_stream_graph
 from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.memory import MemorySaver
 
@@ -49,8 +56,9 @@ class ChatResponse(BaseModel):
     relevant_questions: Optional[list[str]] = None
     sql_result: Optional[dict[str, Any]] = None
     visualization_code: Optional[str] = None
-    visualization_figure: Optional[dict[str, Any]] = None
+    visualization_spec: Optional[str] = None
     visualization_meta: Optional[dict[str, Any]] = None
+    visualization_figure: Optional[dict[str, Any]] = None
 
 
 class VoteRequest(BaseModel):
@@ -92,11 +100,31 @@ def _init_feedback_db(conn: sqlite3.Connection) -> None:
         """
         CREATE TABLE IF NOT EXISTS thread_registry (
             thread_id TEXT PRIMARY KEY,
-            created_at TEXT
+            created_at TEXT,
+            title TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS thread_message_cache (
+            thread_id TEXT PRIMARY KEY,
+            messages_json TEXT NOT NULL,
+            updated_at TEXT
         )
         """
     )
     conn.commit()
+
+    # Migrate old local DBs that were created before title caching was added.
+    thread_registry_columns = {
+        str(row[1])
+        for row in conn.execute("PRAGMA table_info(thread_registry)").fetchall()
+        if len(row) > 1
+    }
+    if "title" not in thread_registry_columns:
+        conn.execute("ALTER TABLE thread_registry ADD COLUMN title TEXT")
+        conn.commit()
 
 
 sqlite_conn = sqlite3.connect(SQLITE_DB_PATH, check_same_thread=False)
@@ -115,6 +143,7 @@ def _build_checkpointer() -> Any:
 
 checkpointer = _build_checkpointer()
 chatbot = None
+stream_subgraph = None
 
 
 def _get_chatbot() -> Any:
@@ -124,12 +153,20 @@ def _get_chatbot() -> Any:
     return chatbot
 
 
+def _get_stream_subgraph() -> Any:
+    global stream_subgraph
+    if stream_subgraph is None:
+        stream_subgraph = build_stream_graph(checkpointer=None)
+    return stream_subgraph
+
+
 def _parse_agent_output(text: str) -> dict[str, Optional[str]]:
     sections = {
         "sql_query": None,
         "result_summary": None,
         "query_results": None,
         "visualization_code": None,
+        "visualization_spec": None,
         "relevant_questions": None,
     }
 
@@ -138,6 +175,7 @@ def _parse_agent_output(text: str) -> dict[str, Optional[str]]:
         "result_summary": "Result Summary:",
         "query_results": "Query Results:",
         "visualization_code": "Visualization Code:",
+        "visualization_spec": "Visualization Spec:",
         "relevant_questions": "Relevant Questions:",
     }
 
@@ -162,58 +200,6 @@ def _strip_code_fences(code: str) -> str:
     return stripped.strip()
 
 
-def _normalize_visualization_code(code: str) -> str:
-    lines = code.splitlines()
-    cleaned_lines: list[str] = []
-
-    for line in lines:
-        stripped = line.strip()
-        lowered = stripped.lower()
-
-        # Imports are unnecessary because modules are pre-injected.
-        if lowered.startswith("import ") or lowered.startswith("from "):
-            continue
-
-        # Never execute rendering side effects in backend.
-        if lowered in {"fig.show()", "plt.show()"}:
-            continue
-
-        cleaned_lines.append(line)
-
-    return "\n".join(cleaned_lines).strip()
-
-
-def _json_safe(value: Any) -> Any:
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-
-    if isinstance(value, dict):
-        return {str(key): _json_safe(item) for key, item in value.items()}
-
-    if isinstance(value, (list, tuple, set)):
-        return [_json_safe(item) for item in value]
-
-    # Handles numpy arrays/scalars and pandas extension values.
-    if hasattr(value, "tolist"):
-        try:
-            return _json_safe(value.tolist())
-        except Exception:
-            pass
-
-    if hasattr(value, "item"):
-        try:
-            return _json_safe(value.item())
-        except Exception:
-            pass
-
-    return str(value)
-
-
-def _stable_hash(value: Any) -> str:
-    canonical = json.dumps(_json_safe(value), sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-
-
 def _build_plotly_figure_json(
     visualization_code: Optional[str],
     sql_result: Optional[dict[str, Any]],
@@ -228,29 +214,12 @@ def _build_plotly_figure_json(
     rows = sql_result.get("data")
     if not isinstance(rows, list):
         return None
-    columns = sql_result.get("columns")
 
-    code = _normalize_visualization_code(_strip_code_fences(raw_code))
+    code = _strip_code_fences(raw_code)
     if not code:
         return None
 
-    try:
-        pandas_module = import_module("pandas")
-        px_module = import_module("plotly.express")
-        go_module = import_module("plotly.graph_objects")
-        subplots_module = import_module("plotly.subplots")
-    except Exception:
-        return None
-
-    DataFrame = getattr(pandas_module, "DataFrame", None)
-    make_subplots = getattr(subplots_module, "make_subplots", None)
-    if DataFrame is None or make_subplots is None:
-        return None
-
-    if isinstance(columns, list) and columns:
-        df = DataFrame(rows, columns=columns)
-    else:
-        df = DataFrame(rows)
+    df = pd.DataFrame(rows)
 
     safe_builtins = {
         "abs": abs,
@@ -258,13 +227,8 @@ def _build_plotly_figure_json(
         "enumerate": enumerate,
         "float": float,
         "int": int,
-        "bool": bool,
-        "all": all,
-        "any": any,
-        "isinstance": isinstance,
         "len": len,
         "list": list,
-        "map": map,
         "max": max,
         "min": min,
         "range": range,
@@ -279,12 +243,9 @@ def _build_plotly_figure_json(
     safe_globals: dict[str, Any] = {
         "__builtins__": safe_builtins,
         "df": df,
-        "dataframe": df,
-        "result_df": df,
-        "query_result_df": df,
-        "pd": pandas_module,
-        "px": px_module,
-        "go": go_module,
+        "pd": pd,
+        "px": px,
+        "go": go,
         "make_subplots": make_subplots,
     }
     safe_locals: dict[str, Any] = {}
@@ -314,18 +275,108 @@ def _build_plotly_figure_json(
         "responsive": True,
         **config,
     }
+    return figure_json
+
+
+def _is_numeric_like(value: Any) -> bool:
+    if isinstance(value, (int, float)):
+        return True
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return False
+        try:
+            float(text)
+            return True
+        except Exception:
+            return False
+    return False
+
+
+def _to_float(value: Any) -> float:
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.strip())
+        except Exception:
+            return 0.0
+    return 0.0
+
+
+def _build_heuristic_plotly_figure_json(
+    sql_result: Optional[dict[str, Any]],
+) -> Optional[dict[str, Any]]:
+    if not sql_result:
+        return None
+
+    rows = sql_result.get("data")
+    if not isinstance(rows, list) or not rows:
+        return None
+
+    columns = sql_result.get("columns")
+    if not isinstance(columns, list) or not columns:
+        sample = rows[0] if isinstance(rows[0], dict) else {}
+        columns = list(sample.keys()) if isinstance(sample, dict) else []
+    if not columns:
+        return None
+
+    sample_rows = [row for row in rows[:30] if isinstance(row, dict)]
+    if not sample_rows:
+        return None
+
+    numeric_columns = [
+        col
+        for col in columns
+        if any(_is_numeric_like(row.get(col)) for row in sample_rows)
+    ]
+    if not numeric_columns:
+        return None
+
+    category_column = next((col for col in columns if col not in numeric_columns), columns[0])
+    metric_columns = [col for col in numeric_columns if col != category_column][:2]
+    if not metric_columns:
+        return None
+
+    top_rows = [row for row in rows[:20] if isinstance(row, dict)]
+    x_values = [str(row.get(category_column, "")) for row in top_rows]
+
+    fig = go.Figure()
+    for metric in metric_columns:
+        y_values = [_to_float(row.get(metric)) for row in top_rows]
+        fig.add_trace(
+            go.Bar(
+                x=x_values,
+                y=y_values,
+                name=str(metric),
+            )
+        )
+
+    fig.update_layout(
+        barmode="group",
+        margin={"l": 40, "r": 20, "t": 24, "b": 80},
+        xaxis={"title": str(category_column), "tickangle": -35},
+        yaxis={"title": "Value"},
+        template="plotly_white",
+    )
+
     try:
-        plotly_utils = import_module("plotly.utils")
-        plotly_json_encoder = getattr(plotly_utils, "PlotlyJSONEncoder", None)
-
-        if plotly_json_encoder is not None:
-            # Preserve dates/timestamps in Plotly-native JSON format.
-            return json.loads(json.dumps(figure_json, cls=plotly_json_encoder))
-
-        # Fallback when Plotly encoder is unavailable.
-        return json.loads(json.dumps(_json_safe(figure_json)))
+        figure_json = fig.to_plotly_json()
+        if not isinstance(figure_json, dict):
+            return None
     except Exception:
         return None
+
+    config = figure_json.get("config")
+    if not isinstance(config, dict):
+        config = {}
+
+    figure_json["config"] = {
+        "displaylogo": False,
+        "responsive": True,
+        **config,
+    }
+    return figure_json
 
 
 def _feedback_exists(thread_id: str, message_id: str) -> bool:
@@ -370,10 +421,31 @@ def _extract_thread_timestamp(thread_id: str) -> datetime:
 def _register_thread_if_missing(thread_id: str) -> None:
     sqlite_conn.execute(
         """
-        INSERT OR IGNORE INTO thread_registry (thread_id, created_at)
-        VALUES (?, ?)
+        INSERT OR IGNORE INTO thread_registry (thread_id, created_at, title)
+        VALUES (?, ?, NULL)
         """,
         (thread_id, datetime.now(UTC).isoformat()),
+    )
+    sqlite_conn.commit()
+
+
+def _set_thread_title_if_missing(thread_id: str, title: Optional[str], max_len: int = 80) -> None:
+    if not title:
+        return
+
+    normalized = title.strip().replace("\n", " ")
+    if not normalized:
+        return
+
+    truncated = normalized[:max_len] + ("..." if len(normalized) > max_len else "")
+
+    sqlite_conn.execute(
+        """
+        UPDATE thread_registry
+        SET title = ?
+        WHERE thread_id = ? AND (title IS NULL OR TRIM(title) = '')
+        """,
+        (truncated, thread_id),
     )
     sqlite_conn.commit()
 
@@ -410,16 +482,50 @@ def _thread_matches_search(chatbot_instance: Any, thread_id: str, query: str) ->
 
 
 def _get_thread_title(chatbot_instance: Any, thread_id: str, max_len: int = 80) -> str:
-    state = chatbot_instance.get_state(config={"configurable": {"thread_id": thread_id}})
-    messages = state.values.get("messages", [])
+    cached_row = sqlite_conn.execute(
+        "SELECT title FROM thread_registry WHERE thread_id=?",
+        (thread_id,),
+    ).fetchone()
+    if cached_row and isinstance(cached_row[0], str) and cached_row[0].strip():
+        return cached_row[0].strip()
 
-    for msg in messages:
-        msg_type = getattr(msg, "type", None)
-        if msg_type in {"human", "HumanMessage"}:
-            content = getattr(msg, "content", "")
-            if isinstance(content, str) and content.strip():
-                title = content.strip().replace("\n", " ")
-                return title[:max_len] + ("..." if len(title) > max_len else "")
+    try:
+        state = chatbot_instance.get_state(config={"configurable": {"thread_id": thread_id}})
+        messages = state.values.get("messages", [])
+
+        for msg in messages:
+            msg_type = getattr(msg, "type", None)
+            if msg_type in {"human", "HumanMessage"}:
+                content = getattr(msg, "content", "")
+                if isinstance(content, str) and content.strip():
+                    title = content.strip().replace("\n", " ")
+                    resolved = title[:max_len] + ("..." if len(title) > max_len else "")
+                    _set_thread_title_if_missing(thread_id, resolved, max_len=max_len)
+                    return resolved
+    except Exception:
+        pass
+
+    # Fallback for stream-first threads before checkpoint message state is persisted.
+    cached = _load_cached_messages(thread_id)
+    for msg in cached:
+        if not isinstance(msg, dict) or msg.get("role") != "user":
+            continue
+
+        parts = msg.get("parts")
+        if not isinstance(parts, list):
+            continue
+
+        text_chunks = [
+            str(part.get("text", ""))
+            for part in parts
+            if isinstance(part, dict) and part.get("type") == "text"
+        ]
+        text = " ".join(chunk.strip() for chunk in text_chunks if chunk and chunk.strip()).strip()
+        if text:
+            title = text.replace("\n", " ")
+            resolved = title[:max_len] + ("..." if len(title) > max_len else "")
+            _set_thread_title_if_missing(thread_id, resolved, max_len=max_len)
+            return resolved
 
     return "Current conversation"
 
@@ -429,10 +535,41 @@ def _list_visible_threads(chatbot_instance: Any) -> list[str]:
     hidden = {row[0] for row in hidden_rows}
 
     all_threads: set[str] = set()
+
+    # Include persisted registry threads so first-turn failures are still visible
+    # in history even if no checkpoint was written yet.
+    registry_rows = sqlite_conn.execute("SELECT thread_id FROM thread_registry").fetchall()
+    for row in registry_rows:
+        if row and row[0]:
+            all_threads.add(str(row[0]))
+
     for checkpoint in checkpointer.list(None):
         all_threads.add(checkpoint.config["configurable"]["thread_id"])
 
     return [thread_id for thread_id in all_threads if thread_id not in hidden]
+
+
+def _is_thread_visible(chatbot_instance: Any, thread_id: str) -> bool:
+    hidden_row = sqlite_conn.execute(
+        "SELECT 1 FROM hidden_threads WHERE thread_id=?",
+        (thread_id,),
+    ).fetchone()
+    if hidden_row:
+        return False
+
+    registry_row = sqlite_conn.execute(
+        "SELECT 1 FROM thread_registry WHERE thread_id=?",
+        (thread_id,),
+    ).fetchone()
+    if registry_row:
+        return True
+
+    try:
+        state = chatbot_instance.get_state(config={"configurable": {"thread_id": thread_id}})
+        messages = state.values.get("messages", [])
+        return bool(messages)
+    except Exception:
+        return False
 
 
 def _extract_text_from_content(content: Any) -> str:
@@ -457,6 +594,38 @@ def _extract_text_from_content(content: Any) -> str:
         return "\n".join(part for part in text_parts if part.strip())
 
     return ""
+
+
+def _load_cached_messages(thread_id: str) -> list[dict[str, Any]]:
+    row = sqlite_conn.execute(
+        "SELECT messages_json FROM thread_message_cache WHERE thread_id=?",
+        (thread_id,),
+    ).fetchone()
+    if not row or not row[0]:
+        return []
+
+    try:
+        parsed = json.loads(row[0])
+        if isinstance(parsed, list):
+            return parsed
+    except Exception:
+        return []
+
+    return []
+
+
+def _save_cached_messages(thread_id: str, messages: list[dict[str, Any]]) -> None:
+    payload = json.dumps(messages, ensure_ascii=True, default=str)
+    sqlite_conn.execute(
+        """
+        INSERT INTO thread_message_cache (thread_id, messages_json, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(thread_id)
+        DO UPDATE SET messages_json=excluded.messages_json, updated_at=excluded.updated_at
+        """,
+        (thread_id, payload, datetime.now(UTC).isoformat()),
+    )
+    sqlite_conn.commit()
 
 
 def _serialize_thread_messages(chatbot_instance: Any, thread_id: str) -> list[dict[str, Any]]:
@@ -523,16 +692,6 @@ def _serialize_thread_messages(chatbot_instance: Any, thread_id: str) -> list[di
                         _append_assistant_data_part(
                             {"type": "data-visualizationFigure", "data": figure_json}
                         )
-
-                    meta_json = _build_visualization_meta(
-                        _get_assistant_sql_result(),
-                        raw_code,
-                        figure_json,
-                    )
-                    if isinstance(meta_json, dict):
-                        _append_assistant_data_part(
-                            {"type": "data-visualizationMeta", "data": meta_json}
-                        )
                 continue
 
         content = _extract_text_from_content(getattr(message, "content", ""))
@@ -575,44 +734,50 @@ def _serialize_thread_messages(chatbot_instance: Any, thread_id: str) -> list[di
     return serialized
 
 
-def _build_visualization_meta(
-    sql_result: Optional[dict[str, Any]],
-    visualization_code: Optional[str],
-    visualization_figure: Optional[dict[str, Any]],
-) -> Optional[dict[str, Any]]:
-    if not sql_result:
-        return None
-
-    rows = sql_result.get("data")
-    columns = sql_result.get("columns")
-    if not isinstance(rows, list):
-        return None
-
-    safe_columns = [str(c) for c in columns] if isinstance(columns, list) else []
-    trace_count = 0
-    if isinstance(visualization_figure, dict) and isinstance(visualization_figure.get("data"), list):
-        trace_count = len(visualization_figure.get("data") or [])
-
-    return {
-        "source": "sql_result_dataframe",
-        "source_row_count": len(rows),
-        "source_column_count": len(safe_columns),
-        "source_columns": safe_columns,
-        "source_data_sha256": _stable_hash(rows),
-        "visualization_code_sha256": _stable_hash(visualization_code or ""),
-        "plotly_trace_count": trace_count,
-    }
-
-
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.post("/api/v1/chat", response_model=ChatResponse)
-def chat(request: ChatRequest) -> ChatResponse:
+@app.get("/api/v1/daily-pulse/questions")
+def get_daily_pulse_questions() -> dict[str, Any]:
+    faq_path = os.path.join(BACKEND_DIR, "FAQ.csv")
+    if not os.path.exists(faq_path):
+        raise HTTPException(status_code=404, detail="FAQ.csv not found")
+
+    questions: list[str] = []
+    try:
+        with open(faq_path, "r", encoding="utf-8-sig", newline="") as csv_file:
+            reader = csv.DictReader(csv_file)
+            if not reader.fieldnames:
+                return {"questions": [], "count": 0}
+
+            field_map = {str(name).strip().lower(): str(name) for name in reader.fieldnames if name}
+            question_field = field_map.get("questions")
+            if not question_field:
+                raise HTTPException(
+                    status_code=400,
+                    detail="FAQ.csv is missing a 'Questions' column",
+                )
+
+            for row in reader:
+                if not isinstance(row, dict):
+                    continue
+                value = str(row.get(question_field, "")).strip()
+                if value:
+                    questions.append(value)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to read FAQ.csv: {exc}")
+
+    return {"questions": questions, "count": len(questions)}
+
+
+def _run_chat_request(request: ChatRequest) -> ChatResponse:
     try:
         _register_thread_if_missing(request.thread_id)
+        _set_thread_title_if_missing(request.thread_id, request.question)
         chatbot_instance = _get_chatbot()
         result = chatbot_instance.invoke(
             {"messages": [HumanMessage(content=request.question)]},
@@ -679,7 +844,8 @@ def chat(request: ChatRequest) -> ChatResponse:
     assistant_text = assistant_text or "Completed"
     parsed_sections = _parse_agent_output(assistant_text)
     visualization_figure = _build_plotly_figure_json(visualization_code, sql_result)
-    visualization_meta = _build_visualization_meta(sql_result, visualization_code, visualization_figure)
+    if visualization_figure is None:
+        visualization_figure = _build_heuristic_plotly_figure_json(sql_result)
 
     relevant_questions: Optional[list[str]] = None
     if parsed_sections["relevant_questions"]:
@@ -697,8 +863,414 @@ def chat(request: ChatRequest) -> ChatResponse:
         relevant_questions=relevant_questions,
         sql_result=sql_result,
         visualization_code=visualization_code,
+        visualization_spec=parsed_sections["visualization_spec"],
+        visualization_meta=None,
         visualization_figure=visualization_figure,
-        visualization_meta=visualization_meta,
+    )
+
+
+@app.post("/api/v1/chat", response_model=ChatResponse)
+def chat(request: ChatRequest) -> ChatResponse:
+    return _run_chat_request(request)
+
+
+def _sse_event(event_name: str, payload: dict[str, Any]) -> str:
+    return f"event: {event_name}\ndata: {json.dumps(payload, ensure_ascii=True)}\n\n"
+
+
+@app.post("/api/v1/chat/stream")
+async def chat_stream(request: ChatRequest) -> StreamingResponse:
+    async def event_generator():
+        try:
+            yield _sse_event(
+                "status",
+                {"key": "analyzing", "label": "Analyzing", "state": "active"},
+            )
+            yield _sse_event(
+                "status",
+                {"key": "generating_sql", "label": "Generating SQL", "state": "active"},
+            )
+
+            _register_thread_if_missing(request.thread_id)
+            _set_thread_title_if_missing(request.thread_id, request.question)
+
+            seed_message = HumanMessage(content=request.question)
+            sql_generator_rag_examples_text, query_decomposer_rag_examples_text, relevant_questions = (
+                await asyncio.to_thread(build_rag_examples, request.question)
+            )
+
+            stream_graph = _get_stream_subgraph()
+            config = {"configurable": {"thread_id": request.thread_id}}
+
+            initial_state: dict[str, Any] = {
+                "question": request.question,
+                "messages": [seed_message],
+                "run_id": datetime.now(UTC).isoformat() + "Z",
+                "last_output": "",
+                "query_decomposer_output": None,
+                "sql_generator_output": None,
+                "sql_reviewer_output": None,
+                "human_reviewer_output": None,
+                "active_review": None,
+                "query_decomposer_rag_examples_text": query_decomposer_rag_examples_text,
+                "sql_generator_rag_examples_text": sql_generator_rag_examples_text,
+                "result_summary": None,
+                "sql_executor_output": None,
+                "visualization_code": None,
+                "visualization_spec": None,
+                "trace": [],
+            }
+
+            state_accumulator: dict[str, Any] = dict(initial_state)
+            summary_emitted = False
+            sql_emitted = False
+            results_emitted = False
+            chart_status_active_emitted = False
+            chart_status_completed_emitted = False
+            last_chart_signature: str | None = None
+            final_summary_text: str = ""
+            final_sql_query: Optional[str] = None
+            final_sql_result: Optional[dict[str, Any]] = None
+            final_visualization_code: Optional[str] = None
+            final_visualization_spec: Optional[str] = None
+            final_visualization_figure: Optional[dict[str, Any]] = None
+
+            async for update in stream_graph.astream(
+                initial_state,
+                config=config,
+                stream_mode="updates",
+            ):
+                if not isinstance(update, dict):
+                    continue
+
+                for node_name, node_delta in update.items():
+                    if not isinstance(node_delta, dict):
+                        continue
+
+                    state_accumulator.update(node_delta)
+
+                    if node_name == "query_decomposer":
+                        yield _sse_event(
+                            "status",
+                            {"key": "analyzing", "label": "Analyzing", "state": "completed"},
+                        )
+                        yield _sse_event(
+                            "status",
+                            {"key": "generating_sql", "label": "Generating SQL", "state": "active"},
+                        )
+                        continue
+
+                    if node_name == "sql_generator":
+                        yield _sse_event(
+                            "status",
+                            {"key": "generating_sql", "label": "Generating SQL", "state": "completed"},
+                        )
+                        yield _sse_event(
+                            "status",
+                            {"key": "fetching_results", "label": "Fetching Results", "state": "active"},
+                        )
+                        continue
+
+                    if node_name == "sql_executor":
+                        yield _sse_event(
+                            "status",
+                            {"key": "fetching_results", "label": "Fetching Results", "state": "completed"},
+                        )
+                        yield _sse_event(
+                            "status",
+                            {"key": "rendering_summary", "label": "Rendering Summary", "state": "active"},
+                        )
+                        continue
+
+                    if node_name == "summarizer_node" and not summary_emitted:
+                        summary_text = str(state_accumulator.get("result_summary") or "").strip()
+                        if summary_text:
+                            final_summary_text = summary_text
+                            for token in re.findall(r"\S+\s*", summary_text):
+                                yield _sse_event("summary_token", {"delta": token})
+                                await asyncio.sleep(0.01)
+
+                            yield _sse_event("summary_done", {"summary": summary_text})
+                            yield _sse_event(
+                                "status",
+                                {
+                                    "key": "rendering_summary",
+                                    "label": "Rendering Summary",
+                                    "state": "completed",
+                                },
+                            )
+                            summary_emitted = True
+
+                        sql_query = state_accumulator.get("sql_generator_output")
+                        if isinstance(sql_query, str) and sql_query.strip() and not sql_emitted:
+                            final_sql_query = sql_query
+                            yield _sse_event("sql_ready", {"sql_query": sql_query})
+                            sql_emitted = True
+
+                        sql_result = state_accumulator.get("sql_executor_output")
+                        if isinstance(sql_result, dict) and not results_emitted:
+                            final_sql_result = sql_result
+                            yield _sse_event("results_ready", {"sql_result": sql_result})
+                            results_emitted = True
+
+                        if not chart_status_active_emitted:
+                            yield _sse_event(
+                                "status",
+                                {
+                                    "key": "generating_visualization",
+                                    "label": "Generating Visualization",
+                                    "state": "active",
+                                },
+                            )
+                            chart_status_active_emitted = True
+                        continue
+
+                    if node_name in {"visualization_node", "visualization_spec_node"}:
+                        visualization_code = state_accumulator.get("visualization_code")
+                        visualization_spec = state_accumulator.get("visualization_spec")
+                        sql_result = state_accumulator.get("sql_executor_output")
+
+                        visualization_figure = None
+                        if isinstance(sql_result, dict) and isinstance(visualization_code, str):
+                            visualization_figure = _build_plotly_figure_json(
+                                visualization_code,
+                                sql_result,
+                            )
+                        if visualization_figure is None and isinstance(sql_result, dict):
+                            visualization_figure = _build_heuristic_plotly_figure_json(sql_result)
+
+                        if any(
+                            [
+                                isinstance(visualization_code, str) and visualization_code.strip(),
+                                isinstance(visualization_spec, str) and visualization_spec.strip(),
+                                isinstance(visualization_figure, dict),
+                            ]
+                        ):
+                            chart_payload = {
+                                "visualization_code": visualization_code,
+                                "visualization_spec": visualization_spec,
+                                "visualization_figure": visualization_figure,
+                                "visualization_meta": None,
+                            }
+                            chart_signature = json.dumps(chart_payload, sort_keys=True, default=str)
+                            if chart_signature == last_chart_signature:
+                                continue
+
+                            yield _sse_event(
+                                "chart_ready",
+                                chart_payload,
+                            )
+                            last_chart_signature = chart_signature
+                            final_visualization_code = (
+                                visualization_code if isinstance(visualization_code, str) else None
+                            )
+                            final_visualization_spec = (
+                                visualization_spec if isinstance(visualization_spec, str) else None
+                            )
+                            final_visualization_figure = (
+                                visualization_figure if isinstance(visualization_figure, dict) else None
+                            )
+
+                        if (
+                            chart_status_active_emitted
+                            and not chart_status_completed_emitted
+                            and node_name == "visualization_spec_node"
+                        ):
+                            yield _sse_event(
+                                "status",
+                                {
+                                    "key": "generating_visualization",
+                                    "label": "Generating Visualization",
+                                    "state": "completed",
+                                },
+                            )
+                            chart_status_completed_emitted = True
+
+            if not summary_emitted:
+                fallback_summary = str(state_accumulator.get("result_summary") or "Completed").strip()
+                final_summary_text = fallback_summary
+                yield _sse_event("summary_done", {"summary": fallback_summary})
+
+            if not sql_emitted:
+                sql_query = state_accumulator.get("sql_generator_output")
+                if isinstance(sql_query, str) and sql_query.strip():
+                    final_sql_query = sql_query
+                    yield _sse_event("sql_ready", {"sql_query": sql_query})
+
+            if not results_emitted:
+                sql_result = state_accumulator.get("sql_executor_output")
+                if isinstance(sql_result, dict):
+                    final_sql_result = sql_result
+                    yield _sse_event("results_ready", {"sql_result": sql_result})
+
+            if last_chart_signature is None:
+                visualization_code = state_accumulator.get("visualization_code")
+                visualization_spec = state_accumulator.get("visualization_spec")
+                sql_result = state_accumulator.get("sql_executor_output")
+                visualization_figure = None
+                if isinstance(sql_result, dict) and isinstance(visualization_code, str):
+                    visualization_figure = _build_plotly_figure_json(visualization_code, sql_result)
+                if visualization_figure is None and isinstance(sql_result, dict):
+                    visualization_figure = _build_heuristic_plotly_figure_json(sql_result)
+
+                if any(
+                    [
+                        isinstance(visualization_code, str) and visualization_code.strip(),
+                        isinstance(visualization_spec, str) and visualization_spec.strip(),
+                        isinstance(visualization_figure, dict),
+                    ]
+                ):
+                    chart_payload = {
+                        "visualization_code": visualization_code,
+                        "visualization_spec": visualization_spec,
+                        "visualization_figure": visualization_figure,
+                        "visualization_meta": None,
+                    }
+                    yield _sse_event(
+                        "chart_ready",
+                        chart_payload,
+                    )
+                    last_chart_signature = json.dumps(chart_payload, sort_keys=True, default=str)
+                    final_visualization_code = (
+                        visualization_code if isinstance(visualization_code, str) else None
+                    )
+                    final_visualization_spec = (
+                        visualization_spec if isinstance(visualization_spec, str) else None
+                    )
+                    final_visualization_figure = (
+                        visualization_figure if isinstance(visualization_figure, dict) else None
+                    )
+
+            if chart_status_active_emitted and not chart_status_completed_emitted:
+                yield _sse_event(
+                    "status",
+                    {
+                        "key": "generating_visualization",
+                        "label": "Generating Visualization",
+                        "state": "completed",
+                    },
+                )
+
+            if relevant_questions:
+                yield _sse_event(
+                    "related_questions_ready",
+                    {"relevant_questions": relevant_questions},
+                )
+
+            # Persist stream conversation so refresh/history works even when
+            # this path does not write wrapper-checkpoint messages.
+            cached_messages = _load_cached_messages(request.thread_id)
+            user_message = {
+                "id": str(uuid.uuid4()),
+                "role": "user",
+                "parts": [{"type": "text", "text": request.question}],
+            }
+            assistant_parts: list[dict[str, Any]] = [
+                {
+                    "type": "text",
+                    "text": final_summary_text or "Completed",
+                }
+            ]
+            if final_summary_text:
+                assistant_parts.append({"type": "data-resultSummary", "data": final_summary_text})
+            if final_sql_query:
+                assistant_parts.append({"type": "data-sqlQuery", "data": final_sql_query})
+            if isinstance(final_sql_result, dict):
+                assistant_parts.append({"type": "data-sqlResult", "data": final_sql_result})
+                columns = final_sql_result.get("columns")
+                if isinstance(columns, list) and columns:
+                    assistant_parts.append({"type": "data-sqlColumns", "data": columns})
+                rows = final_sql_result.get("data")
+                if isinstance(rows, list):
+                    assistant_parts.append({"type": "data-sqlRowCount", "data": len(rows)})
+            if final_visualization_code:
+                assistant_parts.append({"type": "data-visualizationCode", "data": final_visualization_code})
+            if final_visualization_spec:
+                assistant_parts.append({"type": "data-visualizationSpec", "data": final_visualization_spec})
+            if isinstance(final_visualization_figure, dict):
+                assistant_parts.append({"type": "data-visualizationFigure", "data": final_visualization_figure})
+            if relevant_questions:
+                assistant_parts.append({"type": "data-relevantQuestions", "data": relevant_questions})
+
+            assistant_message = {
+                "id": str(uuid.uuid4()),
+                "role": "assistant",
+                "parts": assistant_parts,
+            }
+
+            cached_messages.extend([user_message, assistant_message])
+            _save_cached_messages(request.thread_id, cached_messages)
+
+            yield _sse_event("complete", {"thread_id": request.thread_id})
+        except HTTPException as exc:
+            yield _sse_event(
+                "error",
+                {
+                    "status_code": exc.status_code,
+                    "detail": str(exc.detail),
+                },
+            )
+        except Exception as exc:
+            # If we already produced visible assistant content before the
+            # stream failed, persist a best-effort message for refresh/history.
+            if final_summary_text.strip():
+                cached_messages = _load_cached_messages(request.thread_id)
+                user_message = {
+                    "id": str(uuid.uuid4()),
+                    "role": "user",
+                    "parts": [{"type": "text", "text": request.question}],
+                }
+                assistant_parts: list[dict[str, Any]] = [
+                    {
+                        "type": "text",
+                        "text": final_summary_text,
+                    },
+                    {"type": "data-resultSummary", "data": final_summary_text},
+                ]
+                if final_sql_query:
+                    assistant_parts.append({"type": "data-sqlQuery", "data": final_sql_query})
+                if isinstance(final_sql_result, dict):
+                    assistant_parts.append({"type": "data-sqlResult", "data": final_sql_result})
+                    columns = final_sql_result.get("columns")
+                    if isinstance(columns, list) and columns:
+                        assistant_parts.append({"type": "data-sqlColumns", "data": columns})
+                    rows = final_sql_result.get("data")
+                    if isinstance(rows, list):
+                        assistant_parts.append({"type": "data-sqlRowCount", "data": len(rows)})
+                if final_visualization_code:
+                    assistant_parts.append({"type": "data-visualizationCode", "data": final_visualization_code})
+                if final_visualization_spec:
+                    assistant_parts.append({"type": "data-visualizationSpec", "data": final_visualization_spec})
+                if isinstance(final_visualization_figure, dict):
+                    assistant_parts.append({"type": "data-visualizationFigure", "data": final_visualization_figure})
+                if relevant_questions:
+                    assistant_parts.append({"type": "data-relevantQuestions", "data": relevant_questions})
+
+                assistant_message = {
+                    "id": str(uuid.uuid4()),
+                    "role": "assistant",
+                    "parts": assistant_parts,
+                }
+
+                cached_messages.extend([user_message, assistant_message])
+                _save_cached_messages(request.thread_id, cached_messages)
+
+            yield _sse_event(
+                "error",
+                {
+                    "status_code": 500,
+                    "detail": f"Chat stream failed: {exc}",
+                },
+            )
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
     )
 
 
@@ -750,12 +1322,19 @@ def get_history(limit: int = 20, ending_before: Optional[str] = None, q: Optiona
 @app.get("/api/v1/history/{thread_id}")
 def get_history_messages(thread_id: str) -> dict[str, Any]:
     chatbot_instance = _get_chatbot()
-    visible_threads = set(_list_visible_threads(chatbot_instance))
-
-    if thread_id not in visible_threads:
+    if not _is_thread_visible(chatbot_instance, thread_id):
         return {"messages": []}
 
-    return {"messages": _serialize_thread_messages(chatbot_instance, thread_id)}
+    # Fast path for UI refresh: prefer persisted stream cache when available.
+    cached_messages = _load_cached_messages(thread_id)
+    if cached_messages:
+        return {"messages": cached_messages}
+
+    serialized = _serialize_thread_messages(chatbot_instance, thread_id)
+    if serialized:
+        return {"messages": serialized}
+
+    return {"messages": []}
 
 
 @app.delete("/api/v1/history")

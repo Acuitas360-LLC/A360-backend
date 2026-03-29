@@ -472,6 +472,7 @@ def build_chatbot(checkpointer):
             "result_summary":None,
             "sql_executor_output":None,
             "visualization_code":None,
+            "visualization_spec":None,
             "trace": []
         }
 
@@ -502,6 +503,18 @@ def build_chatbot(checkpointer):
                     additional_kwargs={
                         "type": "visualization",
                         "code": result["visualization_code"]
+                    }
+                )
+            )
+
+        # 4️⃣ Visualization spec as a structured message (new separate node output)
+        if result.get("visualization_spec") is not None:
+            new_messages.append(
+                AIMessage(
+                    content="Visualization Spec",
+                    additional_kwargs={
+                        "type": "visualization_spec",
+                        "spec": result["visualization_spec"]
                     }
                 )
             )

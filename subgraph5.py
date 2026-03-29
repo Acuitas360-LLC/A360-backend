@@ -271,6 +271,7 @@ class AgentState(TypedDict):
     sql_generator_rag_examples_text: str | None
     result_summary: str | None
     visualization_code:str | None
+    visualization_spec:str | None
     active_review: Optional[ReviewDecision]
     sql_executor_output: Optional[dict]
     # control
@@ -3142,6 +3143,94 @@ def visualization_node(state: AgentState):
     }
 
 
+def visualization_spec_node(state: AgentState):
+        query_decomposer_output = state["query_decomposer_output"]
+        sql_executor_output = state["sql_executor_output"]
+
+        prompt = f"""
+        You are a Visualization Spec Agent for a Next.js frontend.
+
+        Return only a strict JSON object that helps frontend chart rendering.
+        Do not return markdown. Do not return explanations.
+
+        Inputs
+
+        Query Decomposer Output:
+        {query_decomposer_output}
+
+        SQL Executor Output:
+        {sql_executor_output}
+
+        Rules
+        - Use only fields that exist in SQL Executor Output columns.
+        - Never invent columns.
+        - Prefer a single-series chart unless multi-series is required by user intent.
+        - If growth-related field exists, include base and growth in same chart spec.
+        - If chart is not useful, set chart_required to false.
+
+        Required output JSON schema:
+        {{
+            "chart_required": true,
+            "reason_code": null,
+            "chart_intent": "trend|comparison|composition|distribution|relationship",
+            "complexity": "single_series|multi_series|combo_dual_axis",
+            "x": {{
+                "field": "",
+                "type": "date|category|numeric",
+                "sort": "asc|desc|none"
+            }},
+            "series": [
+                {{
+                    "name": "",
+                    "field": "",
+                    "mark": "line|area|bar|scatter",
+                    "axis": "left|right",
+                    "stack": false
+                }}
+            ],
+            "group_by_field": null,
+            "transforms": {{
+                "top_n": null,
+                "others_bucket": false,
+                "normalize": "none|percent"
+            }},
+            "interaction": {{
+                "tooltip_fields": [],
+                "show_points": true
+            }},
+            "formatting": {{
+                "x_date_format": "YYYY-MM-DD",
+                "y_format": "number|currency|percent",
+                "tick_rotation": -35
+            }},
+            "renderer_hints": {{
+                "preferred_renderer": "recharts|d3",
+                "recharts_type": "AreaChart|LineChart|BarChart|ComposedChart",
+                "d3_curve": "curveMonotoneX"
+            }},
+            "validation": {{
+                "used_columns": [],
+                "missing_columns": [],
+                "notes": []
+            }}
+        }}
+
+        If chart is impossible:
+        - set chart_required=false
+        - set reason_code to one of: insufficient_numeric_data, single_scalar_result, empty_result, unsupported_shape
+        - series should be empty array
+        """
+
+        response = model.invoke(prompt).content
+        print("Visualization Spec")
+        print("-" * 100)
+        print(response)
+        log_trace(state, "visualization_spec_node", "TextMessage", response)
+        return {
+                "visualization_spec": response,
+        }
+
+
 
 def build_graph(checkpointer=None):
     """
@@ -3156,6 +3245,7 @@ def build_graph(checkpointer=None):
     builder.add_node("sql_executor",sql_executor)
     builder.add_node("summarizer_node",summarizer_node)
     builder.add_node("visualization_node",visualization_node)
+    builder.add_node("visualization_spec_node",visualization_spec_node)
     #builder.add_node("human", human_node)
     builder.add_node("terminator", terminator_node)
 
@@ -3189,8 +3279,10 @@ def build_graph(checkpointer=None):
     #builder.add_edge("sql_reviewer","sql_executor")
     builder.add_edge("sql_executor","summarizer_node")
     builder.add_edge("sql_executor","visualization_node")
+    builder.add_edge("sql_executor","visualization_spec_node")
     builder.add_edge("summarizer_node","terminator")
     builder.add_edge("visualization_node","terminator")
+    builder.add_edge("visualization_spec_node","terminator")
     builder.add_edge("terminator", END)
 
     if checkpointer is None:
@@ -3208,6 +3300,7 @@ if __name__=="__main__":
     "sql_generator_output": None,
     "sql_reviewer_output": None,
     "human_reviewer_output": None,
+    "visualization_spec": None,
     "active_review": None,
     "trace": [],
     "question": user_input,
