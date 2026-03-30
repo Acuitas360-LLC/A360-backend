@@ -67,6 +67,7 @@ class VoteRequest(BaseModel):
     rating: int
     user_query: Optional[str] = None
     assistant_response: Optional[str] = None
+    feedback_text: Optional[str] = None
 
 
 app = FastAPI(title="A360 Backend API", version="0.1.0")
@@ -84,6 +85,7 @@ def _init_feedback_db(conn: sqlite3.Connection) -> None:
             user_query TEXT,
             assistant_response TEXT,
             rating INTEGER,
+            feedback_text TEXT,
             created_at TEXT
         )
         """
@@ -124,6 +126,15 @@ def _init_feedback_db(conn: sqlite3.Connection) -> None:
     }
     if "title" not in thread_registry_columns:
         conn.execute("ALTER TABLE thread_registry ADD COLUMN title TEXT")
+        conn.commit()
+
+    feedback_columns = {
+        str(row[1])
+        for row in conn.execute("PRAGMA table_info(message_feedback)").fetchall()
+        if len(row) > 1
+    }
+    if "feedback_text" not in feedback_columns:
+        conn.execute("ALTER TABLE message_feedback ADD COLUMN feedback_text TEXT")
         conn.commit()
 
 
@@ -387,15 +398,41 @@ def _feedback_exists(thread_id: str, message_id: str) -> bool:
     return cursor.fetchone() is not None
 
 
-def _save_feedback_if_missing(request: VoteRequest) -> bool:
+def _save_or_update_feedback(request: VoteRequest) -> dict[str, bool]:
+    now = datetime.now(UTC).isoformat()
+    normalized_feedback_text = (
+        request.feedback_text.strip() if isinstance(request.feedback_text, str) else None
+    )
+
     if _feedback_exists(request.thread_id, request.message_id):
-        return False
+        sqlite_conn.execute(
+            """
+            UPDATE message_feedback
+            SET rating = ?,
+                user_query = COALESCE(?, user_query),
+                assistant_response = COALESCE(?, assistant_response),
+                feedback_text = COALESCE(?, feedback_text),
+                created_at = ?
+            WHERE thread_id = ? AND message_id = ?
+            """,
+            (
+                request.rating,
+                request.user_query,
+                request.assistant_response,
+                normalized_feedback_text,
+                now,
+                request.thread_id,
+                request.message_id,
+            ),
+        )
+        sqlite_conn.commit()
+        return {"inserted": False, "updated": True}
 
     sqlite_conn.execute(
         """
         INSERT INTO message_feedback
-        (thread_id, message_id, user_query, assistant_response, rating, created_at)
-        VALUES (?, ?, ?, ?, ?, ?)
+        (thread_id, message_id, user_query, assistant_response, rating, feedback_text, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
         (
             request.thread_id,
@@ -403,11 +440,12 @@ def _save_feedback_if_missing(request: VoteRequest) -> bool:
             request.user_query,
             request.assistant_response,
             request.rating,
-            datetime.now(UTC).isoformat(),
+            normalized_feedback_text,
+            now,
         ),
     )
     sqlite_conn.commit()
-    return True
+    return {"inserted": True, "updated": False}
 
 
 def _extract_thread_timestamp(thread_id: str) -> datetime:
@@ -1390,5 +1428,8 @@ def get_votes(thread_id: str) -> list[dict[str, Any]]:
 
 @app.patch("/api/v1/votes")
 def save_vote(request: VoteRequest) -> dict[str, Any]:
-    inserted = _save_feedback_if_missing(request)
-    return {"success": True, "inserted": inserted}
+    if request.rating not in (-1, 1):
+        raise HTTPException(status_code=400, detail="rating must be either -1 or 1")
+
+    result = _save_or_update_feedback(request)
+    return {"success": True, **result}
