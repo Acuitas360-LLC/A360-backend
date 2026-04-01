@@ -12,7 +12,7 @@ from importlib import import_module
 from datetime import UTC, datetime
 from typing import Any, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
@@ -68,6 +68,10 @@ class VoteRequest(BaseModel):
     rating: int
     user_query: Optional[str] = None
     assistant_response: Optional[str] = None
+
+
+class DailyPulseUpdateRequest(BaseModel):
+    questions: list[str] = Field(default_factory=list)
 
 
 app = FastAPI(title="A360 Backend API", version="0.1.0")
@@ -841,6 +845,32 @@ def get_daily_pulse_questions() -> dict[str, Any]:
     return {"questions": questions, "count": len(questions)}
 
 
+@app.put("/api/v1/daily-pulse/questions")
+def update_daily_pulse_questions(request: DailyPulseUpdateRequest) -> dict[str, Any]:
+    faq_path = os.path.join(BACKEND_DIR, "FAQ.csv")
+
+    normalized = [
+        str(question).strip()
+        for question in request.questions
+        if isinstance(question, str) and str(question).strip()
+    ]
+    deduped = list(dict.fromkeys(normalized))
+
+    if not deduped:
+        raise HTTPException(status_code=400, detail="At least one question is required")
+
+    try:
+        with open(faq_path, "w", encoding="utf-8-sig", newline="") as csv_file:
+            writer = csv.DictWriter(csv_file, fieldnames=["Questions"])
+            writer.writeheader()
+            for question in deduped:
+                writer.writerow({"Questions": question})
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to update FAQ.csv: {exc}")
+
+    return {"questions": deduped, "count": len(deduped)}
+
+
 def _run_chat_request(request: ChatRequest) -> ChatResponse:
     try:
         _register_thread_if_missing(request.thread_id)
@@ -946,8 +976,14 @@ def _sse_event(event_name: str, payload: dict[str, Any]) -> str:
 
 
 @app.post("/api/v1/chat/stream")
-async def chat_stream(request: ChatRequest) -> StreamingResponse:
+async def chat_stream(request: ChatRequest, raw_request: Request) -> StreamingResponse:
     async def event_generator():
+        async def _client_disconnected() -> bool:
+            try:
+                return await raw_request.is_disconnected()
+            except Exception:
+                return False
+
         try:
             yield _sse_event(
                 "status",
@@ -957,6 +993,9 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
                 "status",
                 {"key": "generating_sql", "label": "Generating SQL", "state": "active"},
             )
+
+            if await _client_disconnected():
+                return
 
             _register_thread_if_missing(request.thread_id)
             _set_thread_title_if_missing(request.thread_id, request.question)
@@ -1007,6 +1046,9 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
                 config=config,
                 stream_mode="updates",
             ):
+                if await _client_disconnected():
+                    return
+
                 if not isinstance(update, dict):
                     continue
 
@@ -1054,6 +1096,8 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
                         if summary_text:
                             final_summary_text = summary_text
                             for token in re.findall(r"\S+\s*", summary_text):
+                                if await _client_disconnected():
+                                    return
                                 yield _sse_event("summary_token", {"delta": token})
                                 await asyncio.sleep(0.01)
 
@@ -1224,6 +1268,9 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
                     {"relevant_questions": relevant_questions},
                 )
 
+            if await _client_disconnected():
+                return
+
             # Persist stream conversation so refresh/history works even when
             # this path does not write wrapper-checkpoint messages.
             cached_messages = _load_cached_messages(request.thread_id)
@@ -1269,6 +1316,8 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
             _save_cached_messages(request.thread_id, cached_messages)
 
             yield _sse_event("complete", {"thread_id": request.thread_id})
+        except asyncio.CancelledError:
+            return
         except HTTPException as exc:
             yield _sse_event(
                 "error",
