@@ -20,6 +20,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+from plotly.utils import PlotlyJSONEncoder
 
 # Support legacy absolute imports used across backend modules.
 BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -67,7 +68,6 @@ class VoteRequest(BaseModel):
     rating: int
     user_query: Optional[str] = None
     assistant_response: Optional[str] = None
-    feedback_text: Optional[str] = None
 
 
 app = FastAPI(title="A360 Backend API", version="0.1.0")
@@ -85,7 +85,6 @@ def _init_feedback_db(conn: sqlite3.Connection) -> None:
             user_query TEXT,
             assistant_response TEXT,
             rating INTEGER,
-            feedback_text TEXT,
             created_at TEXT
         )
         """
@@ -126,15 +125,6 @@ def _init_feedback_db(conn: sqlite3.Connection) -> None:
     }
     if "title" not in thread_registry_columns:
         conn.execute("ALTER TABLE thread_registry ADD COLUMN title TEXT")
-        conn.commit()
-
-    feedback_columns = {
-        str(row[1])
-        for row in conn.execute("PRAGMA table_info(message_feedback)").fetchall()
-        if len(row) > 1
-    }
-    if "feedback_text" not in feedback_columns:
-        conn.execute("ALTER TABLE message_feedback ADD COLUMN feedback_text TEXT")
         conn.commit()
 
 
@@ -211,6 +201,33 @@ def _strip_code_fences(code: str) -> str:
     return stripped.strip()
 
 
+def _normalize_plotly_json(figure_json: dict[str, Any]) -> Optional[dict[str, Any]]:
+    try:
+        return json.loads(json.dumps(figure_json, cls=PlotlyJSONEncoder))
+    except Exception:
+        return None
+
+
+_KNOWN_IMPORT_PREFIXES = (
+    "import pandas",
+    "import plotly",
+    "from plotly",
+    "import numpy",
+    "import math",
+)
+
+
+def _strip_known_imports(code: str) -> str:
+    lines = code.splitlines()
+    kept: list[str] = []
+    for line in lines:
+        stripped = line.lstrip()
+        if any(stripped.startswith(prefix) for prefix in _KNOWN_IMPORT_PREFIXES):
+            continue
+        kept.append(line)
+    return "\n".join(kept).strip()
+
+
 def _build_plotly_figure_json(
     visualization_code: Optional[str],
     sql_result: Optional[dict[str, Any]],
@@ -226,11 +243,27 @@ def _build_plotly_figure_json(
     if not isinstance(rows, list):
         return None
 
-    code = _strip_code_fences(raw_code)
+    code = _strip_known_imports(_strip_code_fences(raw_code))
     if not code:
         return None
 
     df = pd.DataFrame(rows)
+
+    allowed_imports = {
+        "math": "math",
+        "numpy": "numpy",
+        "pandas": "pandas",
+        "plotly": "plotly",
+        "plotly.express": "plotly.express",
+        "plotly.graph_objects": "plotly.graph_objects",
+        "plotly.subplots": "plotly.subplots",
+    }
+
+    def safe_import(name: str, globals: Any = None, locals: Any = None, fromlist: Any = (), level: int = 0):
+        module_name = allowed_imports.get(name)
+        if not module_name:
+            raise ImportError(f"Import not allowed: {name}")
+        return __import__(module_name, globals, locals, fromlist, level)
 
     safe_builtins = {
         "abs": abs,
@@ -250,6 +283,7 @@ def _build_plotly_figure_json(
         "sum": sum,
         "tuple": tuple,
         "zip": zip,
+        "__import__": safe_import,
     }
     safe_globals: dict[str, Any] = {
         "__builtins__": safe_builtins,
@@ -259,6 +293,20 @@ def _build_plotly_figure_json(
         "go": go,
         "make_subplots": make_subplots,
     }
+
+    try:
+        import math
+
+        safe_globals["math"] = math
+    except Exception:
+        pass
+
+    try:
+        import numpy as np
+
+        safe_globals["np"] = np
+    except Exception:
+        pass
     safe_locals: dict[str, Any] = {}
 
     try:
@@ -277,16 +325,20 @@ def _build_plotly_figure_json(
     except Exception:
         return None
 
-    config = figure_json.get("config")
+    normalized = _normalize_plotly_json(figure_json)
+    if normalized is None:
+        return None
+
+    config = normalized.get("config")
     if not isinstance(config, dict):
         config = {}
 
-    figure_json["config"] = {
+    normalized["config"] = {
         "displaylogo": False,
         "responsive": True,
         **config,
     }
-    return figure_json
+    return normalized
 
 
 def _is_numeric_like(value: Any) -> bool:
@@ -378,16 +430,20 @@ def _build_heuristic_plotly_figure_json(
     except Exception:
         return None
 
-    config = figure_json.get("config")
+    normalized = _normalize_plotly_json(figure_json)
+    if normalized is None:
+        return None
+
+    config = normalized.get("config")
     if not isinstance(config, dict):
         config = {}
 
-    figure_json["config"] = {
+    normalized["config"] = {
         "displaylogo": False,
         "responsive": True,
         **config,
     }
-    return figure_json
+    return normalized
 
 
 def _feedback_exists(thread_id: str, message_id: str) -> bool:
@@ -398,41 +454,15 @@ def _feedback_exists(thread_id: str, message_id: str) -> bool:
     return cursor.fetchone() is not None
 
 
-def _save_or_update_feedback(request: VoteRequest) -> dict[str, bool]:
-    now = datetime.now(UTC).isoformat()
-    normalized_feedback_text = (
-        request.feedback_text.strip() if isinstance(request.feedback_text, str) else None
-    )
-
+def _save_feedback_if_missing(request: VoteRequest) -> bool:
     if _feedback_exists(request.thread_id, request.message_id):
-        sqlite_conn.execute(
-            """
-            UPDATE message_feedback
-            SET rating = ?,
-                user_query = COALESCE(?, user_query),
-                assistant_response = COALESCE(?, assistant_response),
-                feedback_text = COALESCE(?, feedback_text),
-                created_at = ?
-            WHERE thread_id = ? AND message_id = ?
-            """,
-            (
-                request.rating,
-                request.user_query,
-                request.assistant_response,
-                normalized_feedback_text,
-                now,
-                request.thread_id,
-                request.message_id,
-            ),
-        )
-        sqlite_conn.commit()
-        return {"inserted": False, "updated": True}
+        return False
 
     sqlite_conn.execute(
         """
         INSERT INTO message_feedback
-        (thread_id, message_id, user_query, assistant_response, rating, feedback_text, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        (thread_id, message_id, user_query, assistant_response, rating, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
         """,
         (
             request.thread_id,
@@ -440,12 +470,11 @@ def _save_or_update_feedback(request: VoteRequest) -> dict[str, bool]:
             request.user_query,
             request.assistant_response,
             request.rating,
-            normalized_feedback_text,
-            now,
+            datetime.now(UTC).isoformat(),
         ),
     )
     sqlite_conn.commit()
-    return {"inserted": True, "updated": False}
+    return True
 
 
 def _extract_thread_timestamp(thread_id: str) -> datetime:
@@ -1428,8 +1457,5 @@ def get_votes(thread_id: str) -> list[dict[str, Any]]:
 
 @app.patch("/api/v1/votes")
 def save_vote(request: VoteRequest) -> dict[str, Any]:
-    if request.rating not in (-1, 1):
-        raise HTTPException(status_code=400, detail="rating must be either -1 or 1")
-
-    result = _save_or_update_feedback(request)
-    return {"success": True, **result}
+    inserted = _save_feedback_if_missing(request)
+    return {"success": True, "inserted": inserted}

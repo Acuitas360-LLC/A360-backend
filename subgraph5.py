@@ -3144,11 +3144,12 @@ def visualization_node(state: AgentState):
 
 
 def visualization_spec_node(state: AgentState):
-        query_decomposer_output = state["query_decomposer_output"]
-        sql_executor_output = state["sql_executor_output"]
+    query_decomposer_output = state["query_decomposer_output"]
+    sql_executor_output = state["sql_executor_output"]
+    visualization_code = state.get("visualization_code")
 
-        prompt = f"""
-        You are a Visualization Spec Agent for a Next.js frontend.
+    prompt = f"""
+    You are a Visualization Spec Agent for a Next.js frontend.
 
         Return only a strict JSON object that helps frontend chart rendering.
         Do not return markdown. Do not return explanations.
@@ -3161,11 +3162,15 @@ def visualization_spec_node(state: AgentState):
         SQL Executor Output:
         {sql_executor_output}
 
+        Plotly Visualization Code (if available):
+        {visualization_code}
+
         Rules
         - Use only fields that exist in SQL Executor Output columns.
         - Never invent columns.
         - Prefer a single-series chart unless multi-series is required by user intent.
         - If growth-related field exists, include base and growth in same chart spec.
+        - If Plotly code is provided and uses secondary_y, multiple traces, or annotations, reflect that complexity in the spec.
         - If chart is not useful, set chart_required to false.
 
         Required output JSON schema:
@@ -3201,12 +3206,24 @@ def visualization_spec_node(state: AgentState):
             "formatting": {{
                 "x_date_format": "YYYY-MM-DD",
                 "y_format": "number|currency|percent",
-                "tick_rotation": -35
+                "tick_rotation": -35,
+                "x_title": "",
+                "y_left_title": "",
+                "y_right_title": "",
+                "legend_position": "top|bottom"
             }},
+            "annotations": [
+                {{
+                    "type": "hline",
+                    "axis": "left|right",
+                    "value": 0,
+                    "label": ""
+                }}
+            ],
             "renderer_hints": {{
-                "preferred_renderer": "recharts|d3",
+                "preferred_renderer": "recharts|echarts",
                 "recharts_type": "AreaChart|LineChart|BarChart|ComposedChart",
-                "d3_curve": "curveMonotoneX"
+                "echarts_type": "line|bar|scatter|mixed"
             }},
             "validation": {{
                 "used_columns": [],
@@ -3221,14 +3238,14 @@ def visualization_spec_node(state: AgentState):
         - series should be empty array
         """
 
-        response = model.invoke(prompt).content
-        print("Visualization Spec")
-        print("-" * 100)
-        print(response)
-        log_trace(state, "visualization_spec_node", "TextMessage", response)
-        return {
-                "visualization_spec": response,
-        }
+    response = model.invoke(prompt).content
+    print("Visualization Spec")
+    print("-" * 100)
+    print(response)
+    log_trace(state, "visualization_spec_node", "TextMessage", response)
+    return {
+        "visualization_spec": response,
+    }
 
 
 
@@ -3279,7 +3296,7 @@ def build_graph(checkpointer=None):
     #builder.add_edge("sql_reviewer","sql_executor")
     builder.add_edge("sql_executor","summarizer_node")
     builder.add_edge("sql_executor","visualization_node")
-    builder.add_edge("sql_executor","visualization_spec_node")
+    builder.add_edge("visualization_node","visualization_spec_node")
     builder.add_edge("summarizer_node","terminator")
     builder.add_edge("visualization_node","terminator")
     builder.add_edge("visualization_spec_node","terminator")
