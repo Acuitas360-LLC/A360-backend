@@ -1061,7 +1061,7 @@ async def chat_stream(request: ChatRequest, raw_request: Request) -> StreamingRe
                     if node_name == "query_decomposer":
                         yield _sse_event(
                             "status",
-                            {"key": "analyzing", "label": "Analyzing", "state": "completed"},
+                            {"key": "analyzing_data", "label": "Analyzing data", "state": "completed"},
                         )
                         yield _sse_event(
                             "status",
@@ -1112,6 +1112,16 @@ async def chat_stream(request: ChatRequest, raw_request: Request) -> StreamingRe
                             )
                             summary_emitted = True
 
+                        if summary_emitted:
+                            yield _sse_event(
+                                "status",
+                                {
+                                    "key": "preparing_result_table",
+                                    "label": "Preparing result table",
+                                    "state": "active",
+                                },
+                            )
+
                         sql_query = state_accumulator.get("sql_generator_output")
                         if isinstance(sql_query, str) and sql_query.strip() and not sql_emitted:
                             final_sql_query = sql_query
@@ -1123,13 +1133,21 @@ async def chat_stream(request: ChatRequest, raw_request: Request) -> StreamingRe
                             final_sql_result = sql_result
                             yield _sse_event("results_ready", {"sql_result": sql_result})
                             results_emitted = True
+                            yield _sse_event(
+                                "status",
+                                {
+                                    "key": "preparing_result_table",
+                                    "label": "Preparing result table",
+                                    "state": "completed",
+                                },
+                            )
 
                         if not chart_status_active_emitted:
                             yield _sse_event(
                                 "status",
                                 {
                                     "key": "generating_visualization",
-                                    "label": "Generating Visualization",
+                                    "label": "Building visualization",
                                     "state": "active",
                                 },
                             )
@@ -1142,12 +1160,16 @@ async def chat_stream(request: ChatRequest, raw_request: Request) -> StreamingRe
 
                         visualization_figure = None
                         if isinstance(sql_result, dict) and isinstance(visualization_code, str):
-                            visualization_figure = _build_plotly_figure_json(
+                            visualization_figure = await asyncio.to_thread(
+                                _build_plotly_figure_json,
                                 visualization_code,
                                 sql_result,
                             )
                         if visualization_figure is None and isinstance(sql_result, dict):
-                            visualization_figure = _build_heuristic_plotly_figure_json(sql_result)
+                            visualization_figure = await asyncio.to_thread(
+                                _build_heuristic_plotly_figure_json,
+                                sql_result,
+                            )
 
                         if any(
                             [
@@ -1185,7 +1207,7 @@ async def chat_stream(request: ChatRequest, raw_request: Request) -> StreamingRe
                                 "status",
                                 {
                                     "key": "generating_visualization",
-                                    "label": "Generating Visualization",
+                                    "label": "Building visualization",
                                     "state": "completed",
                                 },
                             )
@@ -1213,9 +1235,16 @@ async def chat_stream(request: ChatRequest, raw_request: Request) -> StreamingRe
                 sql_result = state_accumulator.get("sql_executor_output")
                 visualization_figure = None
                 if isinstance(sql_result, dict) and isinstance(visualization_code, str):
-                    visualization_figure = _build_plotly_figure_json(visualization_code, sql_result)
+                    visualization_figure = await asyncio.to_thread(
+                        _build_plotly_figure_json,
+                        visualization_code,
+                        sql_result,
+                    )
                 if visualization_figure is None and isinstance(sql_result, dict):
-                    visualization_figure = _build_heuristic_plotly_figure_json(sql_result)
+                    visualization_figure = await asyncio.to_thread(
+                        _build_heuristic_plotly_figure_json,
+                        sql_result,
+                    )
 
                 if any(
                     [
@@ -1245,7 +1274,7 @@ async def chat_stream(request: ChatRequest, raw_request: Request) -> StreamingRe
                     "status",
                     {
                         "key": "generating_visualization",
-                        "label": "Generating Visualization",
+                        "label": "Building visualization",
                         "state": "completed",
                     },
                 )
