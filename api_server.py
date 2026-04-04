@@ -1136,9 +1136,8 @@ async def chat_stream(request: ChatRequest, raw_request: Request) -> StreamingRe
                             chart_status_active_emitted = True
                         continue
 
-                    if node_name in {"visualization_node", "visualization_spec_node"}:
+                    if node_name == "visualization_node":
                         visualization_code = state_accumulator.get("visualization_code")
-                        visualization_spec = state_accumulator.get("visualization_spec")
                         sql_result = state_accumulator.get("sql_executor_output")
 
                         visualization_figure = None
@@ -1153,13 +1152,11 @@ async def chat_stream(request: ChatRequest, raw_request: Request) -> StreamingRe
                         if any(
                             [
                                 isinstance(visualization_code, str) and visualization_code.strip(),
-                                isinstance(visualization_spec, str) and visualization_spec.strip(),
                                 isinstance(visualization_figure, dict),
                             ]
                         ):
                             chart_payload = {
                                 "visualization_code": visualization_code,
-                                "visualization_spec": visualization_spec,
                                 "visualization_figure": visualization_figure,
                                 "visualization_meta": None,
                             }
@@ -1175,9 +1172,6 @@ async def chat_stream(request: ChatRequest, raw_request: Request) -> StreamingRe
                             final_visualization_code = (
                                 visualization_code if isinstance(visualization_code, str) else None
                             )
-                            final_visualization_spec = (
-                                visualization_spec if isinstance(visualization_spec, str) else None
-                            )
                             final_visualization_figure = (
                                 visualization_figure if isinstance(visualization_figure, dict) else None
                             )
@@ -1185,7 +1179,7 @@ async def chat_stream(request: ChatRequest, raw_request: Request) -> StreamingRe
                         if (
                             chart_status_active_emitted
                             and not chart_status_completed_emitted
-                            and node_name == "visualization_spec_node"
+                            and node_name == "visualization_node"
                         ):
                             yield _sse_event(
                                 "status",
@@ -1216,7 +1210,6 @@ async def chat_stream(request: ChatRequest, raw_request: Request) -> StreamingRe
 
             if last_chart_signature is None:
                 visualization_code = state_accumulator.get("visualization_code")
-                visualization_spec = state_accumulator.get("visualization_spec")
                 sql_result = state_accumulator.get("sql_executor_output")
                 visualization_figure = None
                 if isinstance(sql_result, dict) and isinstance(visualization_code, str):
@@ -1227,13 +1220,11 @@ async def chat_stream(request: ChatRequest, raw_request: Request) -> StreamingRe
                 if any(
                     [
                         isinstance(visualization_code, str) and visualization_code.strip(),
-                        isinstance(visualization_spec, str) and visualization_spec.strip(),
                         isinstance(visualization_figure, dict),
                     ]
                 ):
                     chart_payload = {
                         "visualization_code": visualization_code,
-                        "visualization_spec": visualization_spec,
                         "visualization_figure": visualization_figure,
                         "visualization_meta": None,
                     }
@@ -1244,9 +1235,6 @@ async def chat_stream(request: ChatRequest, raw_request: Request) -> StreamingRe
                     last_chart_signature = json.dumps(chart_payload, sort_keys=True, default=str)
                     final_visualization_code = (
                         visualization_code if isinstance(visualization_code, str) else None
-                    )
-                    final_visualization_spec = (
-                        visualization_spec if isinstance(visualization_spec, str) else None
                     )
                     final_visualization_figure = (
                         visualization_figure if isinstance(visualization_figure, dict) else None
@@ -1299,8 +1287,6 @@ async def chat_stream(request: ChatRequest, raw_request: Request) -> StreamingRe
                     assistant_parts.append({"type": "data-sqlRowCount", "data": len(rows)})
             if final_visualization_code:
                 assistant_parts.append({"type": "data-visualizationCode", "data": final_visualization_code})
-            if final_visualization_spec:
-                assistant_parts.append({"type": "data-visualizationSpec", "data": final_visualization_spec})
             if isinstance(final_visualization_figure, dict):
                 assistant_parts.append({"type": "data-visualizationFigure", "data": final_visualization_figure})
             if relevant_questions:
@@ -1355,8 +1341,6 @@ async def chat_stream(request: ChatRequest, raw_request: Request) -> StreamingRe
                         assistant_parts.append({"type": "data-sqlRowCount", "data": len(rows)})
                 if final_visualization_code:
                     assistant_parts.append({"type": "data-visualizationCode", "data": final_visualization_code})
-                if final_visualization_spec:
-                    assistant_parts.append({"type": "data-visualizationSpec", "data": final_visualization_spec})
                 if isinstance(final_visualization_figure, dict):
                     assistant_parts.append({"type": "data-visualizationFigure", "data": final_visualization_figure})
                 if relevant_questions:

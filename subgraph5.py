@@ -3262,7 +3262,6 @@ def build_graph(checkpointer=None):
     builder.add_node("sql_executor",sql_executor)
     builder.add_node("summarizer_node",summarizer_node)
     builder.add_node("visualization_node",visualization_node)
-    builder.add_node("visualization_spec_node",visualization_spec_node)
     #builder.add_node("human", human_node)
     builder.add_node("terminator", terminator_node)
 
@@ -3296,10 +3295,8 @@ def build_graph(checkpointer=None):
     #builder.add_edge("sql_reviewer","sql_executor")
     builder.add_edge("sql_executor","summarizer_node")
     builder.add_edge("sql_executor","visualization_node")
-    builder.add_edge("visualization_node","visualization_spec_node")
     builder.add_edge("summarizer_node","terminator")
     builder.add_edge("visualization_node","terminator")
-    builder.add_edge("visualization_spec_node","terminator")
     builder.add_edge("terminator", END)
 
     if checkpointer is None:
