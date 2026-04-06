@@ -6,6 +6,7 @@ matplotlib
 langgraph-checkpoint-postgres
 psycopg[binary]
 snowflake-connector-python
+mysql-connector-python
 faiss-cpu
 fastapi
 uvicorn
