@@ -34,8 +34,6 @@ if BACKEND_DIR not in sys.path:
 os.chdir(BACKEND_DIR)
 load_dotenv(os.path.join(BACKEND_DIR, ".env"))
 
-from chatbot7 import build_chatbot, build_rag_examples
-from subgraph5 import build_graph as build_stream_graph
 from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.memory import MemorySaver
 
@@ -426,26 +424,42 @@ def _init_feedback_db(conn: psycopg.Connection) -> None:
     conn.commit()
 
 
-pg_conn = psycopg.connect(DB_URI, autocommit=False)
+pg_conn: Optional[psycopg.Connection] = None
 db_lock = threading.Lock()
-_init_feedback_db(pg_conn)
+
+
+def _ensure_db_connection() -> psycopg.Connection:
+    global pg_conn
+
+    if pg_conn is not None:
+        return pg_conn
+
+    pg_conn = psycopg.connect(DB_URI, autocommit=False, connect_timeout=5)
+    _init_feedback_db(pg_conn)
+    return pg_conn
+
+
+def _db_commit() -> None:
+    _ensure_db_connection().commit()
 
 
 def _db_execute(query: str, params: Optional[tuple[Any, ...]] = None) -> Any:
     global pg_conn
 
     try:
+        conn = _ensure_db_connection()
         if params is None:
-            return pg_conn.execute(query)
-        return pg_conn.execute(query, params)
+            return conn.execute(query)
+        return conn.execute(query, params)
     except (psycopg.OperationalError, psycopg.InterfaceError):
         # PostgreSQL can drop idle connections; reconnect and retry once.
         try:
-            pg_conn.close()
+            if pg_conn is not None:
+                pg_conn.close()
         except Exception:
             pass
 
-        pg_conn = psycopg.connect(DB_URI, autocommit=False)
+        pg_conn = psycopg.connect(DB_URI, autocommit=False, connect_timeout=5)
         _init_feedback_db(pg_conn)
 
         if params is None:
@@ -457,7 +471,7 @@ def _build_checkpointer() -> Any:
     try:
         if PostgresSaver is None:
             return MemorySaver()
-        checkpointer_instance = PostgresSaver(pg_conn)
+        checkpointer_instance = PostgresSaver(_ensure_db_connection())
         checkpointer_instance.setup()
         return checkpointer_instance
     except Exception:
@@ -465,14 +479,25 @@ def _build_checkpointer() -> Any:
         return MemorySaver()
 
 
-checkpointer = _build_checkpointer()
+checkpointer = None
 chatbot = None
 stream_subgraph = None
 
 
+def _build_rag_examples_for_question(question: str) -> tuple[str, str, list[str]]:
+    from chatbot7 import build_rag_examples
+
+    return build_rag_examples(question)
+
+
 def _get_chatbot() -> Any:
+    global checkpointer
     global chatbot
     if chatbot is None:
+        if checkpointer is None:
+            checkpointer = _build_checkpointer()
+        from chatbot7 import build_chatbot
+
         chatbot = build_chatbot(checkpointer=checkpointer)
     return chatbot
 
@@ -480,6 +505,8 @@ def _get_chatbot() -> Any:
 def _get_stream_subgraph() -> Any:
     global stream_subgraph
     if stream_subgraph is None:
+        from subgraph5 import build_graph as build_stream_graph
+
         stream_subgraph = build_stream_graph(checkpointer=None)
     return stream_subgraph
 
@@ -1373,7 +1400,7 @@ async def chat_stream(request: ChatRequest, raw_request: Request) -> StreamingRe
 
             seed_message = HumanMessage(content=request.question)
             sql_generator_rag_examples_text, query_decomposer_rag_examples_text, relevant_questions = (
-                await asyncio.to_thread(build_rag_examples, request.question)
+                await asyncio.to_thread(_build_rag_examples_for_question, request.question)
             )
 
             stream_graph = _get_stream_subgraph()
