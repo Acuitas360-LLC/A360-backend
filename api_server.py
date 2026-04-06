@@ -2,15 +2,18 @@ from __future__ import annotations
 
 import os
 import re
-import sqlite3
 import sys
 import uuid
 import json
 import asyncio
 import csv
+import threading
 from importlib import import_module
 from datetime import UTC, datetime
 from typing import Any, Optional
+import jwt
+from jwt import PyJWKClient
+import psycopg
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -36,12 +39,12 @@ from subgraph5 import build_graph as build_stream_graph
 from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.memory import MemorySaver
 
-SqliteSaver = None
+PostgresSaver = None
 try:
-    sqlite_module = import_module("langgraph.checkpoint.sqlite")
-    SqliteSaver = getattr(sqlite_module, "SqliteSaver", None)
+    postgres_module = import_module("langgraph.checkpoint.postgres")
+    PostgresSaver = getattr(postgres_module, "PostgresSaver", None)
 except Exception:
-    SqliteSaver = None
+    PostgresSaver = None
 
 
 class ChatRequest(BaseModel):
@@ -76,14 +79,223 @@ class DailyPulseUpdateRequest(BaseModel):
 
 app = FastAPI(title="A360 Backend API", version="0.1.0")
 
-SQLITE_DB_PATH = os.path.join(BACKEND_DIR, "chatbot.db")
+# Testing fallback only. Prefer .env values in all non-test environments.
+TEST_DB_URI_FALLBACK = (
+    os.getenv("TEST_DB_URI_FALLBACK", "").strip()
+    or "postgresql://snowflake_admin:"
+    "D6jHttcNb8T1zXa4dWMwHwQiuGhtD0m2mljCdgKIfMI4Y9vTwrRxuenEUNBCdBDd"
+    "@6vdjofao3jarzfssqxyteizsfq.skondys-et17731.southcentralus.azure.postgres.snowflake.app:5432/postgres"
+)
 
 
-def _init_feedback_db(conn: sqlite3.Connection) -> None:
+def _build_db_uri() -> str:
+    env_uri = (
+        os.getenv("DB_URI", "").strip()
+        or os.getenv("POSTGRES_URL", "").strip()
+        or os.getenv("POSTGRES_URI", "").strip()
+    )
+    if env_uri:
+        return env_uri
+
+    host = (os.getenv("DB_HOST", "").strip() or os.getenv("PGHOST", "").strip())
+    port_raw = (os.getenv("DB_PORT", "").strip() or os.getenv("PGPORT", "").strip() or "5432")
+    database = (
+        os.getenv("DB_NAME", "").strip()
+        or os.getenv("POSTGRES_DB", "").strip()
+        or os.getenv("PGDATABASE", "").strip()
+        or "postgres"
+    )
+    user = (
+        os.getenv("DB_USER", "").strip()
+        or os.getenv("POSTGRES_USER", "").strip()
+        or os.getenv("PGUSER", "").strip()
+    )
+    password = (
+        os.getenv("DB_PASSWORD", "").strip()
+        or os.getenv("POSTGRES_PASSWORD", "").strip()
+        or os.getenv("PGPASSWORD", "").strip()
+    )
+
+    try:
+        port = int(port_raw)
+    except ValueError:
+        port = 5432
+
+    if host and user and password:
+        return f"postgresql://{user}:{password}@{host}:{port}/{database}"
+
+    if TEST_DB_URI_FALLBACK:
+        return TEST_DB_URI_FALLBACK
+
+    raise RuntimeError("PostgreSQL connection is not configured in .env")
+
+
+DB_URI = _build_db_uri()
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+AUTH_REQUIRED = _env_flag("AUTH_REQUIRED", False)
+AZURE_AD_TENANT_ID = (
+    os.getenv("AZURE_AD_TENANT_ID", "").strip()
+    or os.getenv("MSAL_TENANT_ID", "").strip()
+)
+AZURE_AD_CLIENT_ID = (
+    os.getenv("AZURE_AD_CLIENT_ID", "").strip()
+    or os.getenv("MSAL_CLIENT_ID", "").strip()
+    or os.getenv("MSAL_AUDIENCE", "").strip()
+)
+AZURE_AD_ISSUER = (
+    os.getenv("AZURE_AD_ISSUER", "").strip()
+    or (
+        f"https://login.microsoftonline.com/{AZURE_AD_TENANT_ID}/v2.0"
+        if AZURE_AD_TENANT_ID
+        else ""
+    )
+)
+AZURE_AD_JWKS_URL = (
+    os.getenv("AZURE_AD_JWKS_URL", "").strip()
+    or (
+        f"https://login.microsoftonline.com/{AZURE_AD_TENANT_ID}/discovery/v2.0/keys"
+        if AZURE_AD_TENANT_ID
+        else ""
+    )
+)
+_jwks_client: Optional[PyJWKClient] = None
+
+
+def _extract_bearer_token(raw_request: Request) -> Optional[str]:
+    authorization = raw_request.headers.get("Authorization", "").strip()
+    if not authorization:
+        return None
+
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer":
+        return None
+
+    normalized = token.strip()
+    return normalized or None
+
+
+def _decode_unverified_token(token: str) -> dict[str, Any]:
+    try:
+        payload = jwt.decode(
+            token,
+            options={
+                "verify_signature": False,
+                "verify_exp": False,
+                "verify_nbf": False,
+                "verify_iat": False,
+                "verify_aud": False,
+                "verify_iss": False,
+            },
+        )
+        if isinstance(payload, dict):
+            return payload
+    except Exception:
+        return {}
+
+    return {}
+
+
+def _verify_azure_ad_token(token: str) -> dict[str, Any]:
+    global _jwks_client
+
+    if not AZURE_AD_TENANT_ID or not AZURE_AD_CLIENT_ID or not AZURE_AD_ISSUER:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Azure AD auth is enabled but required env vars are missing. "
+                "Set AZURE_AD_TENANT_ID and AZURE_AD_CLIENT_ID."
+            ),
+        )
+
+    if not AZURE_AD_JWKS_URL:
+        raise HTTPException(status_code=500, detail="AZURE_AD_JWKS_URL is not configured")
+
+    if _jwks_client is None:
+        _jwks_client = PyJWKClient(AZURE_AD_JWKS_URL)
+
+    try:
+        signing_key = _jwks_client.get_signing_key_from_jwt(token)
+        payload = jwt.decode(
+            token,
+            signing_key.key,
+            algorithms=["RS256"],
+            audience=AZURE_AD_CLIENT_ID,
+            issuer=AZURE_AD_ISSUER,
+        )
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired")
+    except jwt.InvalidTokenError as exc:
+        raise HTTPException(status_code=401, detail=f"Invalid token: {exc}")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=401, detail=f"Token verification failed: {exc}")
+
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=401, detail="Token payload is invalid")
+
+    return payload
+
+
+def _build_user_context(payload: dict[str, Any], authenticated: bool) -> dict[str, Any]:
+    user_id = str(payload.get("oid") or payload.get("sub") or "").strip()
+    email = str(
+        payload.get("preferred_username")
+        or payload.get("upn")
+        or payload.get("email")
+        or ""
+    ).strip()
+
+    return {
+        "user_id": user_id or "local-user",
+        "email": email or None,
+        "authenticated": authenticated,
+    }
+
+
+def _get_request_user(raw_request: Request, require_auth: bool = AUTH_REQUIRED) -> dict[str, Any]:
+    token = _extract_bearer_token(raw_request)
+    if not token:
+        if require_auth:
+            raise HTTPException(status_code=401, detail="Missing bearer token")
+        return {
+            "user_id": "local-user",
+            "email": None,
+            "authenticated": False,
+        }
+
+    # Strict verification path for Azure AD backed idTokens.
+    if AZURE_AD_TENANT_ID and AZURE_AD_CLIENT_ID:
+        payload = _verify_azure_ad_token(token)
+        context = _build_user_context(payload, authenticated=True)
+        if require_auth and context["user_id"] == "local-user":
+            raise HTTPException(status_code=401, detail="Token does not include user identity")
+        return context
+
+    # Compatibility fallback when Azure verification is not configured yet.
+    payload = _decode_unverified_token(token)
+    context = _build_user_context(payload, authenticated=False)
+    if require_auth and context["user_id"] == "local-user":
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid token payload; cannot resolve user identity",
+        )
+    return context
+
+
+def _init_feedback_db(conn: psycopg.Connection) -> None:
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS message_feedback (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             thread_id TEXT,
             message_id TEXT,
             user_query TEXT,
@@ -121,28 +333,21 @@ def _init_feedback_db(conn: sqlite3.Connection) -> None:
     )
     conn.commit()
 
-    # Migrate old local DBs that were created before title caching was added.
-    thread_registry_columns = {
-        str(row[1])
-        for row in conn.execute("PRAGMA table_info(thread_registry)").fetchall()
-        if len(row) > 1
-    }
-    if "title" not in thread_registry_columns:
-        conn.execute("ALTER TABLE thread_registry ADD COLUMN title TEXT")
-        conn.commit()
 
-
-sqlite_conn = sqlite3.connect(SQLITE_DB_PATH, check_same_thread=False)
-_init_feedback_db(sqlite_conn)
+pg_conn = psycopg.connect(DB_URI, autocommit=False)
+db_lock = threading.Lock()
+_init_feedback_db(pg_conn)
 
 
 def _build_checkpointer() -> Any:
     try:
-        if SqliteSaver is None:
+        if PostgresSaver is None:
             return MemorySaver()
-        return SqliteSaver(sqlite_conn)
+        checkpointer_instance = PostgresSaver(pg_conn)
+        checkpointer_instance.setup()
+        return checkpointer_instance
     except Exception:
-        # Fallback keeps development unblocked if sqlite saver is unavailable.
+        # Fallback keeps development unblocked if postgres saver is unavailable.
         return MemorySaver()
 
 
@@ -451,33 +656,35 @@ def _build_heuristic_plotly_figure_json(
 
 
 def _feedback_exists(thread_id: str, message_id: str) -> bool:
-    cursor = sqlite_conn.execute(
-        "SELECT 1 FROM message_feedback WHERE thread_id=? AND message_id=? LIMIT 1",
-        (thread_id, message_id),
-    )
-    return cursor.fetchone() is not None
+    with db_lock:
+        cursor = pg_conn.execute(
+            "SELECT 1 FROM message_feedback WHERE thread_id=%s AND message_id=%s LIMIT 1",
+            (thread_id, message_id),
+        )
+        return cursor.fetchone() is not None
 
 
 def _save_feedback_if_missing(request: VoteRequest) -> bool:
     if _feedback_exists(request.thread_id, request.message_id):
         return False
 
-    sqlite_conn.execute(
-        """
-        INSERT INTO message_feedback
-        (thread_id, message_id, user_query, assistant_response, rating, created_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-        """,
-        (
-            request.thread_id,
-            request.message_id,
-            request.user_query,
-            request.assistant_response,
-            request.rating,
-            datetime.now(UTC).isoformat(),
-        ),
-    )
-    sqlite_conn.commit()
+    with db_lock:
+        pg_conn.execute(
+            """
+            INSERT INTO message_feedback
+            (thread_id, message_id, user_query, assistant_response, rating, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            """,
+            (
+                request.thread_id,
+                request.message_id,
+                request.user_query,
+                request.assistant_response,
+                request.rating,
+                datetime.now(UTC).isoformat(),
+            ),
+        )
+        pg_conn.commit()
     return True
 
 
@@ -490,14 +697,16 @@ def _extract_thread_timestamp(thread_id: str) -> datetime:
 
 
 def _register_thread_if_missing(thread_id: str) -> None:
-    sqlite_conn.execute(
-        """
-        INSERT OR IGNORE INTO thread_registry (thread_id, created_at, title)
-        VALUES (?, ?, NULL)
-        """,
-        (thread_id, datetime.now(UTC).isoformat()),
-    )
-    sqlite_conn.commit()
+    with db_lock:
+        pg_conn.execute(
+            """
+            INSERT INTO thread_registry (thread_id, created_at, title)
+            VALUES (%s, %s, NULL)
+            ON CONFLICT (thread_id) DO NOTHING
+            """,
+            (thread_id, datetime.now(UTC).isoformat()),
+        )
+        pg_conn.commit()
 
 
 def _set_thread_title_if_missing(thread_id: str, title: Optional[str], max_len: int = 80) -> None:
@@ -510,22 +719,24 @@ def _set_thread_title_if_missing(thread_id: str, title: Optional[str], max_len: 
 
     truncated = normalized[:max_len] + ("..." if len(normalized) > max_len else "")
 
-    sqlite_conn.execute(
-        """
-        UPDATE thread_registry
-        SET title = ?
-        WHERE thread_id = ? AND (title IS NULL OR TRIM(title) = '')
-        """,
-        (truncated, thread_id),
-    )
-    sqlite_conn.commit()
+    with db_lock:
+        pg_conn.execute(
+            """
+            UPDATE thread_registry
+            SET title = %s
+            WHERE thread_id = %s AND (title IS NULL OR TRIM(title) = '')
+            """,
+            (truncated, thread_id),
+        )
+        pg_conn.commit()
 
 
 def _get_thread_created_at(thread_id: str) -> datetime:
-    row = sqlite_conn.execute(
-        "SELECT created_at FROM thread_registry WHERE thread_id=?",
-        (thread_id,),
-    ).fetchone()
+    with db_lock:
+        row = pg_conn.execute(
+            "SELECT created_at FROM thread_registry WHERE thread_id=%s",
+            (thread_id,),
+        ).fetchone()
 
     if row and row[0]:
         try:
@@ -553,10 +764,11 @@ def _thread_matches_search(chatbot_instance: Any, thread_id: str, query: str) ->
 
 
 def _get_thread_title(chatbot_instance: Any, thread_id: str, max_len: int = 80) -> str:
-    cached_row = sqlite_conn.execute(
-        "SELECT title FROM thread_registry WHERE thread_id=?",
-        (thread_id,),
-    ).fetchone()
+    with db_lock:
+        cached_row = pg_conn.execute(
+            "SELECT title FROM thread_registry WHERE thread_id=%s",
+            (thread_id,),
+        ).fetchone()
     if cached_row and isinstance(cached_row[0], str) and cached_row[0].strip():
         return cached_row[0].strip()
 
@@ -602,14 +814,16 @@ def _get_thread_title(chatbot_instance: Any, thread_id: str, max_len: int = 80) 
 
 
 def _list_visible_threads(chatbot_instance: Any) -> list[str]:
-    hidden_rows = sqlite_conn.execute("SELECT thread_id FROM hidden_threads").fetchall()
+    with db_lock:
+        hidden_rows = pg_conn.execute("SELECT thread_id FROM hidden_threads").fetchall()
     hidden = {row[0] for row in hidden_rows}
 
     all_threads: set[str] = set()
 
     # Include persisted registry threads so first-turn failures are still visible
     # in history even if no checkpoint was written yet.
-    registry_rows = sqlite_conn.execute("SELECT thread_id FROM thread_registry").fetchall()
+    with db_lock:
+        registry_rows = pg_conn.execute("SELECT thread_id FROM thread_registry").fetchall()
     for row in registry_rows:
         if row and row[0]:
             all_threads.add(str(row[0]))
@@ -621,17 +835,19 @@ def _list_visible_threads(chatbot_instance: Any) -> list[str]:
 
 
 def _is_thread_visible(chatbot_instance: Any, thread_id: str) -> bool:
-    hidden_row = sqlite_conn.execute(
-        "SELECT 1 FROM hidden_threads WHERE thread_id=?",
-        (thread_id,),
-    ).fetchone()
+    with db_lock:
+        hidden_row = pg_conn.execute(
+            "SELECT 1 FROM hidden_threads WHERE thread_id=%s",
+            (thread_id,),
+        ).fetchone()
     if hidden_row:
         return False
 
-    registry_row = sqlite_conn.execute(
-        "SELECT 1 FROM thread_registry WHERE thread_id=?",
-        (thread_id,),
-    ).fetchone()
+    with db_lock:
+        registry_row = pg_conn.execute(
+            "SELECT 1 FROM thread_registry WHERE thread_id=%s",
+            (thread_id,),
+        ).fetchone()
     if registry_row:
         return True
 
@@ -668,10 +884,11 @@ def _extract_text_from_content(content: Any) -> str:
 
 
 def _load_cached_messages(thread_id: str) -> list[dict[str, Any]]:
-    row = sqlite_conn.execute(
-        "SELECT messages_json FROM thread_message_cache WHERE thread_id=?",
-        (thread_id,),
-    ).fetchone()
+    with db_lock:
+        row = pg_conn.execute(
+            "SELECT messages_json FROM thread_message_cache WHERE thread_id=%s",
+            (thread_id,),
+        ).fetchone()
     if not row or not row[0]:
         return []
 
@@ -687,16 +904,17 @@ def _load_cached_messages(thread_id: str) -> list[dict[str, Any]]:
 
 def _save_cached_messages(thread_id: str, messages: list[dict[str, Any]]) -> None:
     payload = json.dumps(messages, ensure_ascii=True, default=str)
-    sqlite_conn.execute(
-        """
-        INSERT INTO thread_message_cache (thread_id, messages_json, updated_at)
-        VALUES (?, ?, ?)
-        ON CONFLICT(thread_id)
-        DO UPDATE SET messages_json=excluded.messages_json, updated_at=excluded.updated_at
-        """,
-        (thread_id, payload, datetime.now(UTC).isoformat()),
-    )
-    sqlite_conn.commit()
+    with db_lock:
+        pg_conn.execute(
+            """
+            INSERT INTO thread_message_cache (thread_id, messages_json, updated_at)
+            VALUES (%s, %s, %s)
+            ON CONFLICT(thread_id)
+            DO UPDATE SET messages_json=EXCLUDED.messages_json, updated_at=EXCLUDED.updated_at
+            """,
+            (thread_id, payload, datetime.now(UTC).isoformat()),
+        )
+        pg_conn.commit()
 
 
 def _serialize_thread_messages(chatbot_instance: Any, thread_id: str) -> list[dict[str, Any]]:
@@ -811,7 +1029,9 @@ def health() -> dict[str, str]:
 
 
 @app.get("/api/v1/daily-pulse/questions")
-def get_daily_pulse_questions() -> dict[str, Any]:
+def get_daily_pulse_questions(raw_request: Request) -> dict[str, Any]:
+    _get_request_user(raw_request)
+
     faq_path = os.path.join(BACKEND_DIR, "FAQ.csv")
     if not os.path.exists(faq_path):
         raise HTTPException(status_code=404, detail="FAQ.csv not found")
@@ -846,7 +1066,12 @@ def get_daily_pulse_questions() -> dict[str, Any]:
 
 
 @app.put("/api/v1/daily-pulse/questions")
-def update_daily_pulse_questions(request: DailyPulseUpdateRequest) -> dict[str, Any]:
+def update_daily_pulse_questions(
+    request: DailyPulseUpdateRequest,
+    raw_request: Request,
+) -> dict[str, Any]:
+    _get_request_user(raw_request)
+
     faq_path = os.path.join(BACKEND_DIR, "FAQ.csv")
 
     normalized = [
@@ -967,7 +1192,8 @@ def _run_chat_request(request: ChatRequest) -> ChatResponse:
 
 
 @app.post("/api/v1/chat", response_model=ChatResponse)
-def chat(request: ChatRequest) -> ChatResponse:
+def chat(request: ChatRequest, raw_request: Request) -> ChatResponse:
+    _get_request_user(raw_request)
     return _run_chat_request(request)
 
 
@@ -977,6 +1203,8 @@ def _sse_event(event_name: str, payload: dict[str, Any]) -> str:
 
 @app.post("/api/v1/chat/stream")
 async def chat_stream(request: ChatRequest, raw_request: Request) -> StreamingResponse:
+    _get_request_user(raw_request)
+
     async def event_generator():
         async def _client_disconnected() -> bool:
             try:
@@ -1404,7 +1632,13 @@ async def chat_stream(request: ChatRequest, raw_request: Request) -> StreamingRe
 
 
 @app.get("/api/v1/history")
-def get_history(limit: int = 20, ending_before: Optional[str] = None, q: Optional[str] = None) -> dict[str, Any]:
+def get_history(
+    raw_request: Request,
+    limit: int = 20,
+    ending_before: Optional[str] = None,
+    q: Optional[str] = None,
+) -> dict[str, Any]:
+    current_user = _get_request_user(raw_request)
     chatbot_instance = _get_chatbot()
 
     thread_ids = _list_visible_threads(chatbot_instance)
@@ -1439,7 +1673,7 @@ def get_history(limit: int = 20, ending_before: Optional[str] = None, q: Optiona
             "id": thread_id,
             "createdAt": _get_thread_created_at(thread_id).isoformat(),
             "title": _get_thread_title(chatbot_instance, thread_id),
-            "userId": "local-user",
+            "userId": current_user["user_id"],
             "visibility": "private",
         }
         for thread_id in page
@@ -1449,7 +1683,8 @@ def get_history(limit: int = 20, ending_before: Optional[str] = None, q: Optiona
 
 
 @app.get("/api/v1/history/{thread_id}")
-def get_history_messages(thread_id: str) -> dict[str, Any]:
+def get_history_messages(thread_id: str, raw_request: Request) -> dict[str, Any]:
+    _get_request_user(raw_request)
     chatbot_instance = _get_chatbot()
     if not _is_thread_visible(chatbot_instance, thread_id):
         return {"messages": []}
@@ -1467,42 +1702,55 @@ def get_history_messages(thread_id: str) -> dict[str, Any]:
 
 
 @app.delete("/api/v1/history")
-def delete_all_history() -> dict[str, bool]:
+def delete_all_history(raw_request: Request) -> dict[str, bool]:
+    _get_request_user(raw_request)
     chatbot_instance = _get_chatbot()
     thread_ids = _list_visible_threads(chatbot_instance)
 
-    for thread_id in thread_ids:
-        sqlite_conn.execute(
-            "INSERT OR IGNORE INTO hidden_threads (thread_id, hidden_at) VALUES (?, ?)",
-            (thread_id, datetime.now(UTC).isoformat()),
-        )
-
-    sqlite_conn.commit()
+    with db_lock:
+        for thread_id in thread_ids:
+            pg_conn.execute(
+                """
+                INSERT INTO hidden_threads (thread_id, hidden_at)
+                VALUES (%s, %s)
+                ON CONFLICT (thread_id) DO NOTHING
+                """,
+                (thread_id, datetime.now(UTC).isoformat()),
+            )
+        pg_conn.commit()
     return {"success": True}
 
 
 @app.delete("/api/v1/history/{thread_id}")
-def delete_history(thread_id: str) -> dict[str, bool]:
-    sqlite_conn.execute(
-        "INSERT OR IGNORE INTO hidden_threads (thread_id, hidden_at) VALUES (?, ?)",
-        (thread_id, datetime.now(UTC).isoformat()),
-    )
-    sqlite_conn.execute("DELETE FROM message_feedback WHERE thread_id=?", (thread_id,))
-    sqlite_conn.commit()
+def delete_history(thread_id: str, raw_request: Request) -> dict[str, bool]:
+    _get_request_user(raw_request)
+    with db_lock:
+        pg_conn.execute(
+            """
+            INSERT INTO hidden_threads (thread_id, hidden_at)
+            VALUES (%s, %s)
+            ON CONFLICT (thread_id) DO NOTHING
+            """,
+            (thread_id, datetime.now(UTC).isoformat()),
+        )
+        pg_conn.execute("DELETE FROM message_feedback WHERE thread_id=%s", (thread_id,))
+        pg_conn.commit()
     return {"success": True}
 
 
 @app.get("/api/v1/votes")
-def get_votes(thread_id: str) -> list[dict[str, Any]]:
-    rows = sqlite_conn.execute(
-        """
-        SELECT thread_id, message_id, rating
-        FROM message_feedback
-        WHERE thread_id=?
-        ORDER BY id DESC
-        """,
-        (thread_id,),
-    ).fetchall()
+def get_votes(thread_id: str, raw_request: Request) -> list[dict[str, Any]]:
+    _get_request_user(raw_request)
+    with db_lock:
+        rows = pg_conn.execute(
+            """
+            SELECT thread_id, message_id, rating
+            FROM message_feedback
+            WHERE thread_id=%s
+            ORDER BY id DESC
+            """,
+            (thread_id,),
+        ).fetchall()
 
     latest_by_message: dict[str, dict[str, Any]] = {}
     for current_thread, message_id, rating in rows:
@@ -1518,6 +1766,7 @@ def get_votes(thread_id: str) -> list[dict[str, Any]]:
 
 
 @app.patch("/api/v1/votes")
-def save_vote(request: VoteRequest) -> dict[str, Any]:
+def save_vote(request: VoteRequest, raw_request: Request) -> dict[str, Any]:
+    _get_request_user(raw_request)
     inserted = _save_feedback_if_missing(request)
     return {"success": True, "inserted": inserted}
