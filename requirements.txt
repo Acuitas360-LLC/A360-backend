@@ -9,6 +9,7 @@ snowflake-connector-python
 faiss-cpu
 fastapi
 uvicorn
+gunicorn
 pandas
 plotly
 PyJWT

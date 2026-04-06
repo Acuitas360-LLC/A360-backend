@@ -296,6 +296,7 @@ def _init_feedback_db(conn: psycopg.Connection) -> None:
         """
         CREATE TABLE IF NOT EXISTS message_feedback (
             id SERIAL PRIMARY KEY,
+            user_id TEXT,
             thread_id TEXT,
             message_id TEXT,
             user_query TEXT,
@@ -308,7 +309,8 @@ def _init_feedback_db(conn: psycopg.Connection) -> None:
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS hidden_threads (
-            thread_id TEXT PRIMARY KEY,
+            user_id TEXT,
+            thread_id TEXT,
             hidden_at TEXT
         )
         """
@@ -316,7 +318,8 @@ def _init_feedback_db(conn: psycopg.Connection) -> None:
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS thread_registry (
-            thread_id TEXT PRIMARY KEY,
+            user_id TEXT,
+            thread_id TEXT,
             created_at TEXT,
             title TEXT
         )
@@ -325,10 +328,99 @@ def _init_feedback_db(conn: psycopg.Connection) -> None:
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS thread_message_cache (
-            thread_id TEXT PRIMARY KEY,
+            user_id TEXT,
+            thread_id TEXT,
             messages_json TEXT NOT NULL,
             updated_at TEXT
         )
+        """
+    )
+
+    # Backfill ownership for legacy rows, then enforce per-user uniqueness.
+    conn.execute("ALTER TABLE message_feedback ADD COLUMN IF NOT EXISTS user_id TEXT")
+    conn.execute("ALTER TABLE hidden_threads ADD COLUMN IF NOT EXISTS user_id TEXT")
+    conn.execute("ALTER TABLE thread_registry ADD COLUMN IF NOT EXISTS user_id TEXT")
+    conn.execute("ALTER TABLE thread_message_cache ADD COLUMN IF NOT EXISTS user_id TEXT")
+
+    conn.execute(
+        """
+        UPDATE message_feedback
+        SET user_id='local-user'
+        WHERE user_id IS NULL OR TRIM(user_id)=''
+        """
+    )
+    conn.execute(
+        """
+        UPDATE hidden_threads
+        SET user_id='local-user'
+        WHERE user_id IS NULL OR TRIM(user_id)=''
+        """
+    )
+    conn.execute(
+        """
+        UPDATE thread_registry
+        SET user_id='local-user'
+        WHERE user_id IS NULL OR TRIM(user_id)=''
+        """
+    )
+    conn.execute(
+        """
+        UPDATE thread_message_cache
+        SET user_id='local-user'
+        WHERE user_id IS NULL OR TRIM(user_id)=''
+        """
+    )
+
+    conn.execute("ALTER TABLE message_feedback ALTER COLUMN user_id SET NOT NULL")
+    conn.execute("ALTER TABLE hidden_threads ALTER COLUMN user_id SET NOT NULL")
+    conn.execute("ALTER TABLE thread_registry ALTER COLUMN user_id SET NOT NULL")
+    conn.execute("ALTER TABLE thread_message_cache ALTER COLUMN user_id SET NOT NULL")
+
+    conn.execute("ALTER TABLE hidden_threads DROP CONSTRAINT IF EXISTS hidden_threads_pkey")
+    conn.execute("ALTER TABLE thread_registry DROP CONSTRAINT IF EXISTS thread_registry_pkey")
+    conn.execute("ALTER TABLE thread_message_cache DROP CONSTRAINT IF EXISTS thread_message_cache_pkey")
+
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS hidden_threads_user_thread_unique
+        ON hidden_threads (user_id, thread_id)
+        """
+    )
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS thread_registry_user_thread_unique
+        ON thread_registry (user_id, thread_id)
+        """
+    )
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS thread_message_cache_user_thread_unique
+        ON thread_message_cache (user_id, thread_id)
+        """
+    )
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS message_feedback_user_thread_message_unique
+        ON message_feedback (user_id, thread_id, message_id)
+        """
+    )
+
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS thread_registry_user_created_idx
+        ON thread_registry (user_id, created_at)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS hidden_threads_user_idx
+        ON hidden_threads (user_id)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS message_feedback_user_thread_idx
+        ON message_feedback (user_id, thread_id)
         """
     )
     conn.commit()
@@ -337,6 +429,28 @@ def _init_feedback_db(conn: psycopg.Connection) -> None:
 pg_conn = psycopg.connect(DB_URI, autocommit=False)
 db_lock = threading.Lock()
 _init_feedback_db(pg_conn)
+
+
+def _db_execute(query: str, params: Optional[tuple[Any, ...]] = None) -> Any:
+    global pg_conn
+
+    try:
+        if params is None:
+            return pg_conn.execute(query)
+        return pg_conn.execute(query, params)
+    except (psycopg.OperationalError, psycopg.InterfaceError):
+        # PostgreSQL can drop idle connections; reconnect and retry once.
+        try:
+            pg_conn.close()
+        except Exception:
+            pass
+
+        pg_conn = psycopg.connect(DB_URI, autocommit=False)
+        _init_feedback_db(pg_conn)
+
+        if params is None:
+            return pg_conn.execute(query)
+        return pg_conn.execute(query, params)
 
 
 def _build_checkpointer() -> Any:
@@ -655,27 +769,31 @@ def _build_heuristic_plotly_figure_json(
     return normalized
 
 
-def _feedback_exists(thread_id: str, message_id: str) -> bool:
+def _feedback_exists(user_id: str, thread_id: str, message_id: str) -> bool:
     with db_lock:
-        cursor = pg_conn.execute(
-            "SELECT 1 FROM message_feedback WHERE thread_id=%s AND message_id=%s LIMIT 1",
-            (thread_id, message_id),
+        cursor = _db_execute(
+            (
+                "SELECT 1 FROM message_feedback "
+                "WHERE user_id=%s AND thread_id=%s AND message_id=%s LIMIT 1"
+            ),
+            (user_id, thread_id, message_id),
         )
         return cursor.fetchone() is not None
 
 
-def _save_feedback_if_missing(request: VoteRequest) -> bool:
-    if _feedback_exists(request.thread_id, request.message_id):
+def _save_feedback_if_missing(request: VoteRequest, user_id: str) -> bool:
+    if _feedback_exists(user_id, request.thread_id, request.message_id):
         return False
 
     with db_lock:
-        pg_conn.execute(
+        _db_execute(
             """
             INSERT INTO message_feedback
-            (thread_id, message_id, user_query, assistant_response, rating, created_at)
-            VALUES (%s, %s, %s, %s, %s, %s)
+            (user_id, thread_id, message_id, user_query, assistant_response, rating, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
             """,
             (
+                user_id,
                 request.thread_id,
                 request.message_id,
                 request.user_query,
@@ -696,20 +814,29 @@ def _extract_thread_timestamp(thread_id: str) -> datetime:
         return datetime(1970, 1, 1, tzinfo=UTC)
 
 
-def _register_thread_if_missing(thread_id: str) -> None:
+def _checkpoint_thread_id(thread_id: str, user_id: str) -> str:
+    return f"{user_id}:{thread_id}"
+
+
+def _register_thread_if_missing(thread_id: str, user_id: str) -> None:
     with db_lock:
-        pg_conn.execute(
+        _db_execute(
             """
-            INSERT INTO thread_registry (thread_id, created_at, title)
-            VALUES (%s, %s, NULL)
-            ON CONFLICT (thread_id) DO NOTHING
+            INSERT INTO thread_registry (user_id, thread_id, created_at, title)
+            VALUES (%s, %s, %s, NULL)
+            ON CONFLICT (user_id, thread_id) DO NOTHING
             """,
-            (thread_id, datetime.now(UTC).isoformat()),
+            (user_id, thread_id, datetime.now(UTC).isoformat()),
         )
         pg_conn.commit()
 
 
-def _set_thread_title_if_missing(thread_id: str, title: Optional[str], max_len: int = 80) -> None:
+def _set_thread_title_if_missing(
+    thread_id: str,
+    user_id: str,
+    title: Optional[str],
+    max_len: int = 80,
+) -> None:
     if not title:
         return
 
@@ -720,22 +847,22 @@ def _set_thread_title_if_missing(thread_id: str, title: Optional[str], max_len: 
     truncated = normalized[:max_len] + ("..." if len(normalized) > max_len else "")
 
     with db_lock:
-        pg_conn.execute(
+        _db_execute(
             """
             UPDATE thread_registry
             SET title = %s
-            WHERE thread_id = %s AND (title IS NULL OR TRIM(title) = '')
+            WHERE user_id = %s AND thread_id = %s AND (title IS NULL OR TRIM(title) = '')
             """,
-            (truncated, thread_id),
+            (truncated, user_id, thread_id),
         )
         pg_conn.commit()
 
 
-def _get_thread_created_at(thread_id: str) -> datetime:
+def _get_thread_created_at(thread_id: str, user_id: str) -> datetime:
     with db_lock:
-        row = pg_conn.execute(
-            "SELECT created_at FROM thread_registry WHERE thread_id=%s",
-            (thread_id,),
+        row = _db_execute(
+            "SELECT created_at FROM thread_registry WHERE user_id=%s AND thread_id=%s",
+            (user_id, thread_id),
         ).fetchone()
 
     if row and row[0]:
@@ -747,11 +874,13 @@ def _get_thread_created_at(thread_id: str) -> datetime:
     return _extract_thread_timestamp(thread_id)
 
 
-def _thread_matches_search(chatbot_instance: Any, thread_id: str, query: str) -> bool:
+def _thread_matches_search(chatbot_instance: Any, thread_id: str, user_id: str, query: str) -> bool:
     if not query:
         return True
 
-    state = chatbot_instance.get_state(config={"configurable": {"thread_id": thread_id}})
+    state = chatbot_instance.get_state(
+        config={"configurable": {"thread_id": _checkpoint_thread_id(thread_id, user_id)}}
+    )
     messages = state.values.get("messages", [])
     lowered = query.lower()
 
@@ -763,17 +892,24 @@ def _thread_matches_search(chatbot_instance: Any, thread_id: str, query: str) ->
     return False
 
 
-def _get_thread_title(chatbot_instance: Any, thread_id: str, max_len: int = 80) -> str:
+def _get_thread_title(
+    chatbot_instance: Any,
+    thread_id: str,
+    user_id: str,
+    max_len: int = 80,
+) -> str:
     with db_lock:
-        cached_row = pg_conn.execute(
-            "SELECT title FROM thread_registry WHERE thread_id=%s",
-            (thread_id,),
+        cached_row = _db_execute(
+            "SELECT title FROM thread_registry WHERE user_id=%s AND thread_id=%s",
+            (user_id, thread_id),
         ).fetchone()
     if cached_row and isinstance(cached_row[0], str) and cached_row[0].strip():
         return cached_row[0].strip()
 
     try:
-        state = chatbot_instance.get_state(config={"configurable": {"thread_id": thread_id}})
+        state = chatbot_instance.get_state(
+            config={"configurable": {"thread_id": _checkpoint_thread_id(thread_id, user_id)}}
+        )
         messages = state.values.get("messages", [])
 
         for msg in messages:
@@ -783,13 +919,18 @@ def _get_thread_title(chatbot_instance: Any, thread_id: str, max_len: int = 80) 
                 if isinstance(content, str) and content.strip():
                     title = content.strip().replace("\n", " ")
                     resolved = title[:max_len] + ("..." if len(title) > max_len else "")
-                    _set_thread_title_if_missing(thread_id, resolved, max_len=max_len)
+                    _set_thread_title_if_missing(
+                        thread_id,
+                        user_id,
+                        resolved,
+                        max_len=max_len,
+                    )
                     return resolved
     except Exception:
         pass
 
     # Fallback for stream-first threads before checkpoint message state is persisted.
-    cached = _load_cached_messages(thread_id)
+    cached = _load_cached_messages(thread_id, user_id)
     for msg in cached:
         if not isinstance(msg, dict) or msg.get("role") != "user":
             continue
@@ -807,15 +948,18 @@ def _get_thread_title(chatbot_instance: Any, thread_id: str, max_len: int = 80) 
         if text:
             title = text.replace("\n", " ")
             resolved = title[:max_len] + ("..." if len(title) > max_len else "")
-            _set_thread_title_if_missing(thread_id, resolved, max_len=max_len)
+            _set_thread_title_if_missing(thread_id, user_id, resolved, max_len=max_len)
             return resolved
 
     return "Current conversation"
 
 
-def _list_visible_threads(chatbot_instance: Any) -> list[str]:
+def _list_visible_threads(chatbot_instance: Any, user_id: str) -> list[str]:
     with db_lock:
-        hidden_rows = pg_conn.execute("SELECT thread_id FROM hidden_threads").fetchall()
+        hidden_rows = _db_execute(
+            "SELECT thread_id FROM hidden_threads WHERE user_id=%s",
+            (user_id,),
+        ).fetchall()
     hidden = {row[0] for row in hidden_rows}
 
     all_threads: set[str] = set()
@@ -823,40 +967,32 @@ def _list_visible_threads(chatbot_instance: Any) -> list[str]:
     # Include persisted registry threads so first-turn failures are still visible
     # in history even if no checkpoint was written yet.
     with db_lock:
-        registry_rows = pg_conn.execute("SELECT thread_id FROM thread_registry").fetchall()
+        registry_rows = _db_execute(
+            "SELECT thread_id FROM thread_registry WHERE user_id=%s",
+            (user_id,),
+        ).fetchall()
     for row in registry_rows:
         if row and row[0]:
             all_threads.add(str(row[0]))
 
-    for checkpoint in checkpointer.list(None):
-        all_threads.add(checkpoint.config["configurable"]["thread_id"])
-
     return [thread_id for thread_id in all_threads if thread_id not in hidden]
 
 
-def _is_thread_visible(chatbot_instance: Any, thread_id: str) -> bool:
+def _is_thread_visible(chatbot_instance: Any, thread_id: str, user_id: str) -> bool:
     with db_lock:
-        hidden_row = pg_conn.execute(
-            "SELECT 1 FROM hidden_threads WHERE thread_id=%s",
-            (thread_id,),
+        hidden_row = _db_execute(
+            "SELECT 1 FROM hidden_threads WHERE user_id=%s AND thread_id=%s",
+            (user_id, thread_id),
         ).fetchone()
     if hidden_row:
         return False
 
     with db_lock:
-        registry_row = pg_conn.execute(
-            "SELECT 1 FROM thread_registry WHERE thread_id=%s",
-            (thread_id,),
+        registry_row = _db_execute(
+            "SELECT 1 FROM thread_registry WHERE user_id=%s AND thread_id=%s",
+            (user_id, thread_id),
         ).fetchone()
-    if registry_row:
-        return True
-
-    try:
-        state = chatbot_instance.get_state(config={"configurable": {"thread_id": thread_id}})
-        messages = state.values.get("messages", [])
-        return bool(messages)
-    except Exception:
-        return False
+    return registry_row is not None
 
 
 def _extract_text_from_content(content: Any) -> str:
@@ -883,11 +1019,11 @@ def _extract_text_from_content(content: Any) -> str:
     return ""
 
 
-def _load_cached_messages(thread_id: str) -> list[dict[str, Any]]:
+def _load_cached_messages(thread_id: str, user_id: str) -> list[dict[str, Any]]:
     with db_lock:
-        row = pg_conn.execute(
-            "SELECT messages_json FROM thread_message_cache WHERE thread_id=%s",
-            (thread_id,),
+        row = _db_execute(
+            "SELECT messages_json FROM thread_message_cache WHERE user_id=%s AND thread_id=%s",
+            (user_id, thread_id),
         ).fetchone()
     if not row or not row[0]:
         return []
@@ -902,23 +1038,29 @@ def _load_cached_messages(thread_id: str) -> list[dict[str, Any]]:
     return []
 
 
-def _save_cached_messages(thread_id: str, messages: list[dict[str, Any]]) -> None:
+def _save_cached_messages(thread_id: str, user_id: str, messages: list[dict[str, Any]]) -> None:
     payload = json.dumps(messages, ensure_ascii=True, default=str)
     with db_lock:
-        pg_conn.execute(
+        _db_execute(
             """
-            INSERT INTO thread_message_cache (thread_id, messages_json, updated_at)
-            VALUES (%s, %s, %s)
-            ON CONFLICT(thread_id)
+            INSERT INTO thread_message_cache (user_id, thread_id, messages_json, updated_at)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT(user_id, thread_id)
             DO UPDATE SET messages_json=EXCLUDED.messages_json, updated_at=EXCLUDED.updated_at
             """,
-            (thread_id, payload, datetime.now(UTC).isoformat()),
+            (user_id, thread_id, payload, datetime.now(UTC).isoformat()),
         )
         pg_conn.commit()
 
 
-def _serialize_thread_messages(chatbot_instance: Any, thread_id: str) -> list[dict[str, Any]]:
-    state = chatbot_instance.get_state(config={"configurable": {"thread_id": thread_id}})
+def _serialize_thread_messages(
+    chatbot_instance: Any,
+    thread_id: str,
+    user_id: str,
+) -> list[dict[str, Any]]:
+    state = chatbot_instance.get_state(
+        config={"configurable": {"thread_id": _checkpoint_thread_id(thread_id, user_id)}}
+    )
     messages = state.values.get("messages", [])
 
     serialized: list[dict[str, Any]] = []
@@ -1096,14 +1238,14 @@ def update_daily_pulse_questions(
     return {"questions": deduped, "count": len(deduped)}
 
 
-def _run_chat_request(request: ChatRequest) -> ChatResponse:
+def _run_chat_request(request: ChatRequest, user_id: str) -> ChatResponse:
     try:
-        _register_thread_if_missing(request.thread_id)
-        _set_thread_title_if_missing(request.thread_id, request.question)
+        _register_thread_if_missing(request.thread_id, user_id)
+        _set_thread_title_if_missing(request.thread_id, user_id, request.question)
         chatbot_instance = _get_chatbot()
         result = chatbot_instance.invoke(
             {"messages": [HumanMessage(content=request.question)]},
-            config={"configurable": {"thread_id": request.thread_id}},
+            config={"configurable": {"thread_id": _checkpoint_thread_id(request.thread_id, user_id)}},
         )
     except Exception as exc:
         error_text = str(exc)
@@ -1193,8 +1335,8 @@ def _run_chat_request(request: ChatRequest) -> ChatResponse:
 
 @app.post("/api/v1/chat", response_model=ChatResponse)
 def chat(request: ChatRequest, raw_request: Request) -> ChatResponse:
-    _get_request_user(raw_request)
-    return _run_chat_request(request)
+    current_user = _get_request_user(raw_request)
+    return _run_chat_request(request, current_user["user_id"])
 
 
 def _sse_event(event_name: str, payload: dict[str, Any]) -> str:
@@ -1203,7 +1345,8 @@ def _sse_event(event_name: str, payload: dict[str, Any]) -> str:
 
 @app.post("/api/v1/chat/stream")
 async def chat_stream(request: ChatRequest, raw_request: Request) -> StreamingResponse:
-    _get_request_user(raw_request)
+    current_user = _get_request_user(raw_request)
+    current_user_id = current_user["user_id"]
 
     async def event_generator():
         async def _client_disconnected() -> bool:
@@ -1225,8 +1368,8 @@ async def chat_stream(request: ChatRequest, raw_request: Request) -> StreamingRe
             if await _client_disconnected():
                 return
 
-            _register_thread_if_missing(request.thread_id)
-            _set_thread_title_if_missing(request.thread_id, request.question)
+            _register_thread_if_missing(request.thread_id, current_user_id)
+            _set_thread_title_if_missing(request.thread_id, current_user_id, request.question)
 
             seed_message = HumanMessage(content=request.question)
             sql_generator_rag_examples_text, query_decomposer_rag_examples_text, relevant_questions = (
@@ -1234,7 +1377,11 @@ async def chat_stream(request: ChatRequest, raw_request: Request) -> StreamingRe
             )
 
             stream_graph = _get_stream_subgraph()
-            config = {"configurable": {"thread_id": request.thread_id}}
+            config = {
+                "configurable": {
+                    "thread_id": _checkpoint_thread_id(request.thread_id, current_user_id)
+                }
+            }
 
             initial_state: dict[str, Any] = {
                 "question": request.question,
@@ -1518,7 +1665,7 @@ async def chat_stream(request: ChatRequest, raw_request: Request) -> StreamingRe
 
             # Persist stream conversation so refresh/history works even when
             # this path does not write wrapper-checkpoint messages.
-            cached_messages = _load_cached_messages(request.thread_id)
+            cached_messages = _load_cached_messages(request.thread_id, current_user_id)
             user_message = {
                 "id": str(uuid.uuid4()),
                 "role": "user",
@@ -1556,7 +1703,7 @@ async def chat_stream(request: ChatRequest, raw_request: Request) -> StreamingRe
             }
 
             cached_messages.extend([user_message, assistant_message])
-            _save_cached_messages(request.thread_id, cached_messages)
+            _save_cached_messages(request.thread_id, current_user_id, cached_messages)
 
             yield _sse_event("complete", {"thread_id": request.thread_id})
         except asyncio.CancelledError:
@@ -1573,7 +1720,7 @@ async def chat_stream(request: ChatRequest, raw_request: Request) -> StreamingRe
             # If we already produced visible assistant content before the
             # stream failed, persist a best-effort message for refresh/history.
             if final_summary_text.strip():
-                cached_messages = _load_cached_messages(request.thread_id)
+                cached_messages = _load_cached_messages(request.thread_id, current_user_id)
                 user_message = {
                     "id": str(uuid.uuid4()),
                     "role": "user",
@@ -1610,7 +1757,7 @@ async def chat_stream(request: ChatRequest, raw_request: Request) -> StreamingRe
                 }
 
                 cached_messages.extend([user_message, assistant_message])
-                _save_cached_messages(request.thread_id, cached_messages)
+                _save_cached_messages(request.thread_id, current_user_id, cached_messages)
 
             yield _sse_event(
                 "error",
@@ -1639,9 +1786,10 @@ def get_history(
     q: Optional[str] = None,
 ) -> dict[str, Any]:
     current_user = _get_request_user(raw_request)
+    current_user_id = current_user["user_id"]
     chatbot_instance = _get_chatbot()
 
-    thread_ids = _list_visible_threads(chatbot_instance)
+    thread_ids = _list_visible_threads(chatbot_instance, current_user_id)
 
     normalized_q = q.strip() if q else None
 
@@ -1649,12 +1797,12 @@ def get_history(
         thread_ids = [
             thread_id
             for thread_id in thread_ids
-            if _thread_matches_search(chatbot_instance, thread_id, normalized_q)
+            if _thread_matches_search(chatbot_instance, thread_id, current_user_id, normalized_q)
         ]
 
     sorted_threads = sorted(
         thread_ids,
-        key=_get_thread_created_at,
+        key=lambda thread_id: _get_thread_created_at(thread_id, current_user_id),
         reverse=True,
     )
 
@@ -1671,9 +1819,9 @@ def get_history(
     chats = [
         {
             "id": thread_id,
-            "createdAt": _get_thread_created_at(thread_id).isoformat(),
-            "title": _get_thread_title(chatbot_instance, thread_id),
-            "userId": current_user["user_id"],
+            "createdAt": _get_thread_created_at(thread_id, current_user_id).isoformat(),
+            "title": _get_thread_title(chatbot_instance, thread_id, current_user_id),
+            "userId": current_user_id,
             "visibility": "private",
         }
         for thread_id in page
@@ -1684,17 +1832,18 @@ def get_history(
 
 @app.get("/api/v1/history/{thread_id}")
 def get_history_messages(thread_id: str, raw_request: Request) -> dict[str, Any]:
-    _get_request_user(raw_request)
+    current_user = _get_request_user(raw_request)
+    current_user_id = current_user["user_id"]
     chatbot_instance = _get_chatbot()
-    if not _is_thread_visible(chatbot_instance, thread_id):
-        return {"messages": []}
+    if not _is_thread_visible(chatbot_instance, thread_id, current_user_id):
+        raise HTTPException(status_code=404, detail="Thread not found")
 
     # Fast path for UI refresh: prefer persisted stream cache when available.
-    cached_messages = _load_cached_messages(thread_id)
+    cached_messages = _load_cached_messages(thread_id, current_user_id)
     if cached_messages:
         return {"messages": cached_messages}
 
-    serialized = _serialize_thread_messages(chatbot_instance, thread_id)
+    serialized = _serialize_thread_messages(chatbot_instance, thread_id, current_user_id)
     if serialized:
         return {"messages": serialized}
 
@@ -1703,19 +1852,20 @@ def get_history_messages(thread_id: str, raw_request: Request) -> dict[str, Any]
 
 @app.delete("/api/v1/history")
 def delete_all_history(raw_request: Request) -> dict[str, bool]:
-    _get_request_user(raw_request)
+    current_user = _get_request_user(raw_request)
+    current_user_id = current_user["user_id"]
     chatbot_instance = _get_chatbot()
-    thread_ids = _list_visible_threads(chatbot_instance)
+    thread_ids = _list_visible_threads(chatbot_instance, current_user_id)
 
     with db_lock:
         for thread_id in thread_ids:
-            pg_conn.execute(
+            _db_execute(
                 """
-                INSERT INTO hidden_threads (thread_id, hidden_at)
-                VALUES (%s, %s)
-                ON CONFLICT (thread_id) DO NOTHING
+                INSERT INTO hidden_threads (user_id, thread_id, hidden_at)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (user_id, thread_id) DO NOTHING
                 """,
-                (thread_id, datetime.now(UTC).isoformat()),
+                (current_user_id, thread_id, datetime.now(UTC).isoformat()),
             )
         pg_conn.commit()
     return {"success": True}
@@ -1723,33 +1873,46 @@ def delete_all_history(raw_request: Request) -> dict[str, bool]:
 
 @app.delete("/api/v1/history/{thread_id}")
 def delete_history(thread_id: str, raw_request: Request) -> dict[str, bool]:
-    _get_request_user(raw_request)
+    current_user = _get_request_user(raw_request)
+    current_user_id = current_user["user_id"]
+    chatbot_instance = _get_chatbot()
+    if not _is_thread_visible(chatbot_instance, thread_id, current_user_id):
+        raise HTTPException(status_code=404, detail="Thread not found")
+
     with db_lock:
-        pg_conn.execute(
+        _db_execute(
             """
-            INSERT INTO hidden_threads (thread_id, hidden_at)
-            VALUES (%s, %s)
-            ON CONFLICT (thread_id) DO NOTHING
+            INSERT INTO hidden_threads (user_id, thread_id, hidden_at)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (user_id, thread_id) DO NOTHING
             """,
-            (thread_id, datetime.now(UTC).isoformat()),
+            (current_user_id, thread_id, datetime.now(UTC).isoformat()),
         )
-        pg_conn.execute("DELETE FROM message_feedback WHERE thread_id=%s", (thread_id,))
+        _db_execute(
+            "DELETE FROM message_feedback WHERE user_id=%s AND thread_id=%s",
+            (current_user_id, thread_id),
+        )
         pg_conn.commit()
     return {"success": True}
 
 
 @app.get("/api/v1/votes")
 def get_votes(thread_id: str, raw_request: Request) -> list[dict[str, Any]]:
-    _get_request_user(raw_request)
+    current_user = _get_request_user(raw_request)
+    current_user_id = current_user["user_id"]
+    chatbot_instance = _get_chatbot()
+    if not _is_thread_visible(chatbot_instance, thread_id, current_user_id):
+        raise HTTPException(status_code=404, detail="Thread not found")
+
     with db_lock:
-        rows = pg_conn.execute(
+        rows = _db_execute(
             """
             SELECT thread_id, message_id, rating
             FROM message_feedback
-            WHERE thread_id=%s
+            WHERE user_id=%s AND thread_id=%s
             ORDER BY id DESC
             """,
-            (thread_id,),
+            (current_user_id, thread_id),
         ).fetchall()
 
     latest_by_message: dict[str, dict[str, Any]] = {}
@@ -1767,6 +1930,11 @@ def get_votes(thread_id: str, raw_request: Request) -> list[dict[str, Any]]:
 
 @app.patch("/api/v1/votes")
 def save_vote(request: VoteRequest, raw_request: Request) -> dict[str, Any]:
-    _get_request_user(raw_request)
-    inserted = _save_feedback_if_missing(request)
+    current_user = _get_request_user(raw_request)
+    current_user_id = current_user["user_id"]
+    chatbot_instance = _get_chatbot()
+    if not _is_thread_visible(chatbot_instance, request.thread_id, current_user_id):
+        raise HTTPException(status_code=404, detail="Thread not found")
+
+    inserted = _save_feedback_if_missing(request, current_user_id)
     return {"success": True, "inserted": inserted}
