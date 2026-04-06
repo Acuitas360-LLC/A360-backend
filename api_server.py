@@ -8,6 +8,7 @@ import json
 import asyncio
 import csv
 import threading
+import logging
 from importlib import import_module
 from datetime import UTC, datetime
 from typing import Any, Optional
@@ -16,7 +17,7 @@ from jwt import PyJWKClient
 import psycopg
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 import pandas as pd
@@ -77,6 +78,22 @@ class DailyPulseUpdateRequest(BaseModel):
 
 app = FastAPI(title="A360 Backend API", version="0.1.0")
 
+
+class DatabaseUnavailableError(RuntimeError):
+    pass
+
+
+@app.exception_handler(DatabaseUnavailableError)
+async def _database_unavailable_handler(
+    raw_request: Request, exc: DatabaseUnavailableError
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=503,
+        content={
+            "detail": "Database is temporarily unavailable. Please retry shortly.",
+        },
+    )
+
 # Testing fallback only. Prefer .env values in all non-test environments.
 TEST_DB_URI_FALLBACK = (
     os.getenv("TEST_DB_URI_FALLBACK", "").strip()
@@ -129,6 +146,18 @@ def _build_db_uri() -> str:
 
 
 DB_URI = _build_db_uri()
+logger = logging.getLogger(__name__)
+
+
+def _get_db_connect_timeout() -> int:
+    raw = os.getenv("DB_CONNECT_TIMEOUT", "12").strip()
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 12
+
+
+DB_CONNECT_TIMEOUT = _get_db_connect_timeout()
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -434,7 +463,7 @@ def _ensure_db_connection() -> psycopg.Connection:
     if pg_conn is not None:
         return pg_conn
 
-    pg_conn = psycopg.connect(DB_URI, autocommit=False, connect_timeout=5)
+    pg_conn = psycopg.connect(DB_URI, autocommit=False, connect_timeout=DB_CONNECT_TIMEOUT)
     _init_feedback_db(pg_conn)
     return pg_conn
 
@@ -451,7 +480,7 @@ def _db_execute(query: str, params: Optional[tuple[Any, ...]] = None) -> Any:
         if params is None:
             return conn.execute(query)
         return conn.execute(query, params)
-    except (psycopg.OperationalError, psycopg.InterfaceError):
+    except (psycopg.OperationalError, psycopg.InterfaceError, psycopg.errors.ConnectionTimeout):
         # PostgreSQL can drop idle connections; reconnect and retry once.
         try:
             if pg_conn is not None:
@@ -459,12 +488,16 @@ def _db_execute(query: str, params: Optional[tuple[Any, ...]] = None) -> Any:
         except Exception:
             pass
 
-        pg_conn = psycopg.connect(DB_URI, autocommit=False, connect_timeout=5)
-        _init_feedback_db(pg_conn)
+        try:
+            pg_conn = psycopg.connect(DB_URI, autocommit=False, connect_timeout=DB_CONNECT_TIMEOUT)
+            _init_feedback_db(pg_conn)
 
-        if params is None:
-            return pg_conn.execute(query)
-        return pg_conn.execute(query, params)
+            if params is None:
+                return pg_conn.execute(query)
+            return pg_conn.execute(query, params)
+        except (psycopg.OperationalError, psycopg.InterfaceError, psycopg.errors.ConnectionTimeout) as exc:
+            logger.warning("PostgreSQL reconnect failed: %s", exc.__class__.__name__)
+            raise DatabaseUnavailableError("PostgreSQL connection is unavailable") from exc
 
 
 def _build_checkpointer() -> Any:
