@@ -10,7 +10,7 @@ import csv
 import threading
 import logging
 from importlib import import_module
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Optional
 import jwt
 from jwt import PyJWKClient
@@ -150,14 +150,25 @@ logger = logging.getLogger(__name__)
 
 
 def _get_db_connect_timeout() -> int:
-    raw = os.getenv("DB_CONNECT_TIMEOUT", "12").strip()
+    raw = os.getenv("DB_CONNECT_TIMEOUT", "5").strip()
     try:
         return max(1, int(raw))
     except ValueError:
-        return 12
+        return 5
 
 
 DB_CONNECT_TIMEOUT = _get_db_connect_timeout()
+
+
+def _get_db_unavailable_cooldown_seconds() -> int:
+    raw = os.getenv("DB_UNAVAILABLE_COOLDOWN_SECONDS", "20").strip()
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 20
+
+
+DB_UNAVAILABLE_COOLDOWN_SECONDS = _get_db_unavailable_cooldown_seconds()
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -455,16 +466,21 @@ def _init_feedback_db(conn: psycopg.Connection) -> None:
 
 pg_conn: Optional[psycopg.Connection] = None
 db_lock = threading.Lock()
+db_schema_ready = False
+db_unavailable_until: Optional[datetime] = None
 
 
 def _ensure_db_connection() -> psycopg.Connection:
     global pg_conn
+    global db_schema_ready
 
     if pg_conn is not None:
         return pg_conn
 
     pg_conn = psycopg.connect(DB_URI, autocommit=False, connect_timeout=DB_CONNECT_TIMEOUT)
-    _init_feedback_db(pg_conn)
+    if not db_schema_ready:
+        _init_feedback_db(pg_conn)
+        db_schema_ready = True
     return pg_conn
 
 
@@ -474,30 +490,29 @@ def _db_commit() -> None:
 
 def _db_execute(query: str, params: Optional[tuple[Any, ...]] = None) -> Any:
     global pg_conn
+    global db_schema_ready
+    global db_unavailable_until
+
+    now = datetime.now(UTC)
+    if db_unavailable_until and now < db_unavailable_until:
+        raise DatabaseUnavailableError("PostgreSQL connection is unavailable")
 
     try:
         conn = _ensure_db_connection()
+        db_unavailable_until = None
         if params is None:
             return conn.execute(query)
         return conn.execute(query, params)
-    except (psycopg.OperationalError, psycopg.InterfaceError, psycopg.errors.ConnectionTimeout):
-        # PostgreSQL can drop idle connections; reconnect and retry once.
+    except (psycopg.OperationalError, psycopg.InterfaceError, psycopg.errors.ConnectionTimeout) as exc:
         try:
             if pg_conn is not None:
                 pg_conn.close()
         except Exception:
             pass
-
-        try:
-            pg_conn = psycopg.connect(DB_URI, autocommit=False, connect_timeout=DB_CONNECT_TIMEOUT)
-            _init_feedback_db(pg_conn)
-
-            if params is None:
-                return pg_conn.execute(query)
-            return pg_conn.execute(query, params)
-        except (psycopg.OperationalError, psycopg.InterfaceError, psycopg.errors.ConnectionTimeout) as exc:
-            logger.warning("PostgreSQL reconnect failed: %s", exc.__class__.__name__)
-            raise DatabaseUnavailableError("PostgreSQL connection is unavailable") from exc
+        pg_conn = None
+        db_unavailable_until = datetime.now(UTC) + timedelta(seconds=DB_UNAVAILABLE_COOLDOWN_SECONDS)
+        logger.warning("PostgreSQL reconnect failed: %s", exc.__class__.__name__)
+        raise DatabaseUnavailableError("PostgreSQL connection is unavailable") from exc
 
 
 def _build_checkpointer() -> Any:
@@ -1409,6 +1424,14 @@ async def chat_stream(request: ChatRequest, raw_request: Request) -> StreamingRe
     current_user_id = current_user["user_id"]
 
     async def event_generator():
+        final_summary_text: str = ""
+        final_sql_query: Optional[str] = None
+        final_sql_result: Optional[dict[str, Any]] = None
+        final_visualization_code: Optional[str] = None
+        final_visualization_spec: Optional[str] = None
+        final_visualization_figure: Optional[dict[str, Any]] = None
+        relevant_questions: list[str] = []
+
         async def _client_disconnected() -> bool:
             try:
                 return await raw_request.is_disconnected()
@@ -1469,12 +1492,6 @@ async def chat_stream(request: ChatRequest, raw_request: Request) -> StreamingRe
             chart_status_active_emitted = False
             chart_status_completed_emitted = False
             last_chart_signature: str | None = None
-            final_summary_text: str = ""
-            final_sql_query: Optional[str] = None
-            final_sql_result: Optional[dict[str, Any]] = None
-            final_visualization_code: Optional[str] = None
-            final_visualization_spec: Optional[str] = None
-            final_visualization_figure: Optional[dict[str, Any]] = None
 
             async for update in stream_graph.astream(
                 initial_state,
@@ -1850,6 +1867,19 @@ def get_history(
     chatbot_instance = _get_chatbot()
 
     thread_ids = _list_visible_threads(chatbot_instance, current_user_id)
+    thread_meta: dict[str, dict[str, Any]] = {}
+    with db_lock:
+        registry_rows = _db_execute(
+            "SELECT thread_id, created_at, title FROM thread_registry WHERE user_id=%s",
+            (current_user_id,),
+        ).fetchall()
+    for row in registry_rows:
+        if not row or not row[0]:
+            continue
+        thread_meta[str(row[0])] = {
+            "created_at": row[1],
+            "title": row[2],
+        }
 
     normalized_q = q.strip() if q else None
 
@@ -1862,7 +1892,11 @@ def get_history(
 
     sorted_threads = sorted(
         thread_ids,
-        key=lambda thread_id: _get_thread_created_at(thread_id, current_user_id),
+        key=lambda thread_id: (
+            datetime.fromisoformat(str(thread_meta.get(thread_id, {}).get("created_at")))
+            if thread_meta.get(thread_id, {}).get("created_at")
+            else _extract_thread_timestamp(thread_id)
+        ),
         reverse=True,
     )
 
@@ -1879,8 +1913,15 @@ def get_history(
     chats = [
         {
             "id": thread_id,
-            "createdAt": _get_thread_created_at(thread_id, current_user_id).isoformat(),
-            "title": _get_thread_title(chatbot_instance, thread_id, current_user_id),
+            "createdAt": (
+                datetime.fromisoformat(str(thread_meta.get(thread_id, {}).get("created_at"))).isoformat()
+                if thread_meta.get(thread_id, {}).get("created_at")
+                else _extract_thread_timestamp(thread_id).isoformat()
+            ),
+            "title": (
+                str(thread_meta.get(thread_id, {}).get("title") or "").strip()
+                or _get_thread_title(chatbot_instance, thread_id, current_user_id)
+            ),
             "userId": current_user_id,
             "visibility": "private",
         }
