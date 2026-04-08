@@ -6,9 +6,10 @@ import sys
 import uuid
 import json
 import asyncio
-import csv
 import threading
 import logging
+import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from importlib import import_module
 from datetime import UTC, datetime, timedelta
 from typing import Any, Optional
@@ -76,7 +77,21 @@ class DailyPulseUpdateRequest(BaseModel):
     questions: list[str] = Field(default_factory=list)
 
 
+DEFAULT_DAILY_PULSE_QUESTIONS: tuple[str, ...] = (
+    "Are we seeing strong short-term sales momentum?",
+    "How are we doing in terms of adding new businesses?",
+)
+
+
 app = FastAPI(title="A360 Backend API", version="0.1.0")
+
+
+DB_WARMUP_ON_STARTUP = os.getenv("DB_WARMUP_ON_STARTUP", "1").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 
 class DatabaseUnavailableError(RuntimeError):
@@ -94,13 +109,8 @@ async def _database_unavailable_handler(
         },
     )
 
-# Testing fallback only. Prefer .env values in all non-test environments.
-TEST_DB_URI_FALLBACK = (
-    os.getenv("TEST_DB_URI_FALLBACK", "").strip()
-    or "postgresql://snowflake_admin:"
-    "D6jHttcNb8T1zXa4dWMwHwQiuGhtD0m2mljCdgKIfMI4Y9vTwrRxuenEUNBCdBDd"
-    "@6vdjofao3jarzfssqxyteizsfq.skondys-et17731.southcentralus.azure.postgres.snowflake.app:5432/postgres"
-)
+# Optional testing fallback only. Keep empty in production.
+TEST_DB_URI_FALLBACK = os.getenv("TEST_DB_URI_FALLBACK", "").strip()
 
 
 def _build_db_uri() -> str:
@@ -139,7 +149,7 @@ def _build_db_uri() -> str:
     if host and user and password:
         return f"postgresql://{user}:{password}@{host}:{port}/{database}"
 
-    if TEST_DB_URI_FALLBACK:
+    if TEST_DB_URI_FALLBACK and _env_flag("ALLOW_TEST_DB_FALLBACK", False):
         return TEST_DB_URI_FALLBACK
 
     raise RuntimeError("PostgreSQL connection is not configured in .env")
@@ -169,6 +179,39 @@ def _get_db_unavailable_cooldown_seconds() -> int:
 
 
 DB_UNAVAILABLE_COOLDOWN_SECONDS = _get_db_unavailable_cooldown_seconds()
+
+
+def _get_db_statement_timeout_ms() -> int:
+    raw = os.getenv("DB_STATEMENT_TIMEOUT_MS", "8000").strip()
+    try:
+        return max(500, int(raw))
+    except ValueError:
+        return 8000
+
+
+DB_STATEMENT_TIMEOUT_MS = _get_db_statement_timeout_ms()
+
+
+def _get_db_bootstrap_statement_timeout_ms() -> int:
+    raw = os.getenv("DB_BOOTSTRAP_STATEMENT_TIMEOUT_MS", "120000").strip()
+    try:
+        return max(DB_STATEMENT_TIMEOUT_MS, int(raw))
+    except ValueError:
+        return max(DB_STATEMENT_TIMEOUT_MS, 120000)
+
+
+DB_BOOTSTRAP_STATEMENT_TIMEOUT_MS = _get_db_bootstrap_statement_timeout_ms()
+
+
+def _get_history_rebuild_timeout_seconds() -> float:
+    raw = os.getenv("HISTORY_REBUILD_TIMEOUT_SECONDS", "2.0").strip()
+    try:
+        return max(0.1, float(raw))
+    except ValueError:
+        return 2.0
+
+
+HISTORY_REBUILD_TIMEOUT_SECONDS = _get_history_rebuild_timeout_seconds()
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -332,6 +375,47 @@ def _get_request_user(raw_request: Request, require_auth: bool = AUTH_REQUIRED) 
 def _init_feedback_db(conn: psycopg.Connection) -> None:
     conn.execute(
         """
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+            migration_key TEXT PRIMARY KEY,
+            applied_at TEXT
+        )
+        """
+    )
+
+    # Lightweight compatibility guard: always ensure thread_registry has hidden-flag shape
+    # even when bootstrap has already run in older deployments.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS thread_registry (
+            user_id TEXT,
+            thread_id TEXT,
+            created_at TEXT,
+            title TEXT,
+            is_hidden BOOLEAN,
+            hidden_at TEXT
+        )
+        """
+    )
+    conn.execute("ALTER TABLE thread_registry ADD COLUMN IF NOT EXISTS is_hidden BOOLEAN")
+    conn.execute("ALTER TABLE thread_registry ADD COLUMN IF NOT EXISTS hidden_at TEXT")
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS thread_registry_user_hidden_created_idx
+        ON thread_registry (user_id, is_hidden, created_at)
+        """
+    )
+
+    bootstrap_migration_key = "schema_bootstrap_v2"
+    bootstrap_row = conn.execute(
+        "SELECT 1 FROM schema_migrations WHERE migration_key=%s",
+        (bootstrap_migration_key,),
+    ).fetchone()
+    if bootstrap_row:
+        conn.commit()
+        return
+
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS message_feedback (
             id SERIAL PRIMARY KEY,
             user_id TEXT,
@@ -359,7 +443,9 @@ def _init_feedback_db(conn: psycopg.Connection) -> None:
             user_id TEXT,
             thread_id TEXT,
             created_at TEXT,
-            title TEXT
+            title TEXT,
+            is_hidden BOOLEAN,
+            hidden_at TEXT
         )
         """
     )
@@ -374,49 +460,99 @@ def _init_feedback_db(conn: psycopg.Connection) -> None:
         """
     )
 
-    # Backfill ownership for legacy rows, then enforce per-user uniqueness.
-    conn.execute("ALTER TABLE message_feedback ADD COLUMN IF NOT EXISTS user_id TEXT")
-    conn.execute("ALTER TABLE hidden_threads ADD COLUMN IF NOT EXISTS user_id TEXT")
-    conn.execute("ALTER TABLE thread_registry ADD COLUMN IF NOT EXISTS user_id TEXT")
-    conn.execute("ALTER TABLE thread_message_cache ADD COLUMN IF NOT EXISTS user_id TEXT")
+    migration_key = "user_scope_v1"
+    migration_row = conn.execute(
+        "SELECT 1 FROM schema_migrations WHERE migration_key=%s",
+        (migration_key,),
+    ).fetchone()
 
-    conn.execute(
-        """
-        UPDATE message_feedback
-        SET user_id='local-user'
-        WHERE user_id IS NULL OR TRIM(user_id)=''
-        """
-    )
-    conn.execute(
-        """
-        UPDATE hidden_threads
-        SET user_id='local-user'
-        WHERE user_id IS NULL OR TRIM(user_id)=''
-        """
-    )
-    conn.execute(
-        """
-        UPDATE thread_registry
-        SET user_id='local-user'
-        WHERE user_id IS NULL OR TRIM(user_id)=''
-        """
-    )
-    conn.execute(
-        """
-        UPDATE thread_message_cache
-        SET user_id='local-user'
-        WHERE user_id IS NULL OR TRIM(user_id)=''
-        """
-    )
+    # Ensure modern columns exist irrespective of older migration markers.
+    conn.execute("ALTER TABLE thread_registry ADD COLUMN IF NOT EXISTS is_hidden BOOLEAN")
+    conn.execute("ALTER TABLE thread_registry ADD COLUMN IF NOT EXISTS hidden_at TEXT")
 
-    conn.execute("ALTER TABLE message_feedback ALTER COLUMN user_id SET NOT NULL")
-    conn.execute("ALTER TABLE hidden_threads ALTER COLUMN user_id SET NOT NULL")
-    conn.execute("ALTER TABLE thread_registry ALTER COLUMN user_id SET NOT NULL")
-    conn.execute("ALTER TABLE thread_message_cache ALTER COLUMN user_id SET NOT NULL")
+    # One-time legacy backfill/migration. Running this every startup can block history for minutes.
+    if not migration_row:
+        conn.execute("ALTER TABLE message_feedback ADD COLUMN IF NOT EXISTS user_id TEXT")
+        conn.execute("ALTER TABLE hidden_threads ADD COLUMN IF NOT EXISTS user_id TEXT")
+        conn.execute("ALTER TABLE thread_registry ADD COLUMN IF NOT EXISTS user_id TEXT")
+        conn.execute("ALTER TABLE thread_message_cache ADD COLUMN IF NOT EXISTS user_id TEXT")
 
-    conn.execute("ALTER TABLE hidden_threads DROP CONSTRAINT IF EXISTS hidden_threads_pkey")
-    conn.execute("ALTER TABLE thread_registry DROP CONSTRAINT IF EXISTS thread_registry_pkey")
-    conn.execute("ALTER TABLE thread_message_cache DROP CONSTRAINT IF EXISTS thread_message_cache_pkey")
+        conn.execute(
+            """
+            UPDATE message_feedback
+            SET user_id='local-user'
+            WHERE user_id IS NULL OR TRIM(user_id)=''
+            """
+        )
+        conn.execute(
+            """
+            UPDATE hidden_threads
+            SET user_id='local-user'
+            WHERE user_id IS NULL OR TRIM(user_id)=''
+            """
+        )
+        conn.execute(
+            """
+            UPDATE thread_registry
+            SET user_id='local-user'
+            WHERE user_id IS NULL OR TRIM(user_id)=''
+            """
+        )
+        conn.execute(
+            """
+            UPDATE thread_message_cache
+            SET user_id='local-user'
+            WHERE user_id IS NULL OR TRIM(user_id)=''
+            """
+        )
+
+        conn.execute("ALTER TABLE message_feedback ALTER COLUMN user_id SET NOT NULL")
+        conn.execute("ALTER TABLE hidden_threads ALTER COLUMN user_id SET NOT NULL")
+        conn.execute("ALTER TABLE thread_registry ALTER COLUMN user_id SET NOT NULL")
+        conn.execute("ALTER TABLE thread_message_cache ALTER COLUMN user_id SET NOT NULL")
+
+        conn.execute("ALTER TABLE hidden_threads DROP CONSTRAINT IF EXISTS hidden_threads_pkey")
+        conn.execute("ALTER TABLE thread_registry DROP CONSTRAINT IF EXISTS thread_registry_pkey")
+        conn.execute("ALTER TABLE thread_message_cache DROP CONSTRAINT IF EXISTS thread_message_cache_pkey")
+
+        conn.execute(
+            """
+            INSERT INTO schema_migrations (migration_key, applied_at)
+            VALUES (%s, %s)
+            ON CONFLICT (migration_key) DO NOTHING
+            """,
+            (migration_key, datetime.now(UTC).isoformat()),
+        )
+
+    hidden_flag_migration_key = "hidden_flag_v1"
+    hidden_flag_migration_row = conn.execute(
+        "SELECT 1 FROM schema_migrations WHERE migration_key=%s",
+        (hidden_flag_migration_key,),
+    ).fetchone()
+    if not hidden_flag_migration_row:
+        conn.execute(
+            """
+            UPDATE thread_registry
+            SET is_hidden=FALSE
+            WHERE is_hidden IS NULL
+            """
+        )
+        conn.execute(
+            """
+            UPDATE thread_registry r
+            SET is_hidden=TRUE, hidden_at=COALESCE(r.hidden_at, h.hidden_at)
+            FROM hidden_threads h
+            WHERE r.user_id=h.user_id AND r.thread_id=h.thread_id
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO schema_migrations (migration_key, applied_at)
+            VALUES (%s, %s)
+            ON CONFLICT (migration_key) DO NOTHING
+            """,
+            (hidden_flag_migration_key, datetime.now(UTC).isoformat()),
+        )
 
     conn.execute(
         """
@@ -451,6 +587,12 @@ def _init_feedback_db(conn: psycopg.Connection) -> None:
     )
     conn.execute(
         """
+        CREATE INDEX IF NOT EXISTS thread_registry_user_hidden_created_idx
+        ON thread_registry (user_id, is_hidden, created_at)
+        """
+    )
+    conn.execute(
+        """
         CREATE INDEX IF NOT EXISTS hidden_threads_user_idx
         ON hidden_threads (user_id)
         """
@@ -461,6 +603,14 @@ def _init_feedback_db(conn: psycopg.Connection) -> None:
         ON message_feedback (user_id, thread_id)
         """
     )
+    conn.execute(
+        """
+        INSERT INTO schema_migrations (migration_key, applied_at)
+        VALUES (%s, %s)
+        ON CONFLICT (migration_key) DO NOTHING
+        """,
+        (bootstrap_migration_key, datetime.now(UTC).isoformat()),
+    )
     conn.commit()
 
 
@@ -468,6 +618,25 @@ pg_conn: Optional[psycopg.Connection] = None
 db_lock = threading.Lock()
 db_schema_ready = False
 db_unavailable_until: Optional[datetime] = None
+
+
+@app.on_event("startup")
+async def _startup_db_warmup() -> None:
+    if not DB_WARMUP_ON_STARTUP:
+        logger.info("DB warmup skipped (DB_WARMUP_ON_STARTUP disabled)")
+        return
+
+    started_at = time.perf_counter()
+    try:
+        with db_lock:
+            _ensure_db_connection()
+    except Exception as exc:
+        elapsed_ms = (time.perf_counter() - started_at) * 1000
+        logger.warning("DB warmup failed elapsed_ms=%.1f err=%s", elapsed_ms, exc)
+        return
+
+    elapsed_ms = (time.perf_counter() - started_at) * 1000
+    logger.info("DB warmup complete elapsed_ms=%.1f schema_ready=%s", elapsed_ms, db_schema_ready)
 
 
 def _ensure_db_connection() -> psycopg.Connection:
@@ -479,8 +648,12 @@ def _ensure_db_connection() -> psycopg.Connection:
 
     pg_conn = psycopg.connect(DB_URI, autocommit=False, connect_timeout=DB_CONNECT_TIMEOUT)
     if not db_schema_ready:
+        # Allow bootstrap/migration work to complete once with a wider timeout window.
+        pg_conn.execute(f"SET statement_timeout = {DB_BOOTSTRAP_STATEMENT_TIMEOUT_MS}")
         _init_feedback_db(pg_conn)
         db_schema_ready = True
+    # Runtime timeout for request queries to keep UI endpoints responsive.
+    pg_conn.execute(f"SET statement_timeout = {DB_STATEMENT_TIMEOUT_MS}")
     return pg_conn
 
 
@@ -497,22 +670,46 @@ def _db_execute(query: str, params: Optional[tuple[Any, ...]] = None) -> Any:
     if db_unavailable_until and now < db_unavailable_until:
         raise DatabaseUnavailableError("PostgreSQL connection is unavailable")
 
-    try:
-        conn = _ensure_db_connection()
-        db_unavailable_until = None
-        if params is None:
-            return conn.execute(query)
-        return conn.execute(query, params)
-    except (psycopg.OperationalError, psycopg.InterfaceError, psycopg.errors.ConnectionTimeout) as exc:
+    for attempt in (1, 2):
         try:
-            if pg_conn is not None:
-                pg_conn.close()
-        except Exception:
-            pass
-        pg_conn = None
-        db_unavailable_until = datetime.now(UTC) + timedelta(seconds=DB_UNAVAILABLE_COOLDOWN_SECONDS)
-        logger.warning("PostgreSQL reconnect failed: %s", exc.__class__.__name__)
-        raise DatabaseUnavailableError("PostgreSQL connection is unavailable") from exc
+            conn = _ensure_db_connection()
+            db_unavailable_until = None
+            if params is None:
+                return conn.execute(query)
+            return conn.execute(query, params)
+        except psycopg.errors.InFailedSqlTransaction as exc:
+            # Recover from a previously failed statement in the same transaction.
+            try:
+                if pg_conn is not None:
+                    pg_conn.rollback()
+            except Exception:
+                pass
+            if attempt == 1:
+                continue
+            raise DatabaseUnavailableError("PostgreSQL transaction is in failed state") from exc
+        except psycopg.errors.QueryCanceled as exc:
+            # Statement timeout should fail fast but not poison the connection pool/cooldown.
+            try:
+                if pg_conn is not None:
+                    pg_conn.rollback()
+            except Exception:
+                pass
+            logger.warning("PostgreSQL query timeout: %s", exc.__class__.__name__)
+            raise DatabaseUnavailableError("PostgreSQL query timed out") from exc
+        except (psycopg.OperationalError, psycopg.InterfaceError, psycopg.errors.ConnectionTimeout) as exc:
+            try:
+                if pg_conn is not None:
+                    pg_conn.close()
+            except Exception:
+                pass
+            pg_conn = None
+            if attempt == 1:
+                continue
+            db_unavailable_until = datetime.now(UTC) + timedelta(seconds=DB_UNAVAILABLE_COOLDOWN_SECONDS)
+            logger.warning("PostgreSQL reconnect failed: %s", exc.__class__.__name__)
+            raise DatabaseUnavailableError("PostgreSQL connection is unavailable") from exc
+
+    raise DatabaseUnavailableError("PostgreSQL query execution failed")
 
 
 def _build_checkpointer() -> Any:
@@ -949,6 +1146,15 @@ def _get_thread_created_at(thread_id: str, user_id: str) -> datetime:
     return _extract_thread_timestamp(thread_id)
 
 
+def _coerce_thread_created_at(thread_id: str, raw_created_at: Any) -> datetime:
+    if raw_created_at:
+        try:
+            return datetime.fromisoformat(str(raw_created_at))
+        except Exception:
+            pass
+    return _extract_thread_timestamp(thread_id)
+
+
 def _thread_matches_search(chatbot_instance: Any, thread_id: str, user_id: str, query: str) -> bool:
     if not query:
         return True
@@ -1031,40 +1237,28 @@ def _get_thread_title(
 
 def _list_visible_threads(chatbot_instance: Any, user_id: str) -> list[str]:
     with db_lock:
-        hidden_rows = _db_execute(
-            "SELECT thread_id FROM hidden_threads WHERE user_id=%s",
-            (user_id,),
-        ).fetchall()
-    hidden = {row[0] for row in hidden_rows}
-
-    all_threads: set[str] = set()
-
-    # Include persisted registry threads so first-turn failures are still visible
-    # in history even if no checkpoint was written yet.
-    with db_lock:
         registry_rows = _db_execute(
-            "SELECT thread_id FROM thread_registry WHERE user_id=%s",
+            """
+            SELECT thread_id
+            FROM thread_registry
+            WHERE user_id=%s AND COALESCE(is_hidden, FALSE)=FALSE
+            """,
             (user_id,),
         ).fetchall()
-    for row in registry_rows:
-        if row and row[0]:
-            all_threads.add(str(row[0]))
 
-    return [thread_id for thread_id in all_threads if thread_id not in hidden]
+    return [str(row[0]) for row in registry_rows if row and row[0]]
 
 
 def _is_thread_visible(chatbot_instance: Any, thread_id: str, user_id: str) -> bool:
     with db_lock:
-        hidden_row = _db_execute(
-            "SELECT 1 FROM hidden_threads WHERE user_id=%s AND thread_id=%s",
-            (user_id, thread_id),
-        ).fetchone()
-    if hidden_row:
-        return False
-
-    with db_lock:
         registry_row = _db_execute(
-            "SELECT 1 FROM thread_registry WHERE user_id=%s AND thread_id=%s",
+            """
+            SELECT 1
+            FROM thread_registry
+            WHERE user_id=%s
+              AND thread_id=%s
+              AND COALESCE(is_hidden, FALSE)=FALSE
+            """,
             (user_id, thread_id),
         ).fetchone()
     return registry_row is not None
@@ -1240,6 +1434,42 @@ def _serialize_thread_messages(
     return serialized
 
 
+def _serialize_thread_messages_with_timeout(
+    chatbot_instance: Any,
+    thread_id: str,
+    user_id: str,
+    timeout_seconds: float = HISTORY_REBUILD_TIMEOUT_SECONDS,
+) -> list[dict[str, Any]]:
+    # Guard slow checkpoint reconstruction so page render doesn't stall for minutes.
+    executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        future = executor.submit(
+            _serialize_thread_messages,
+            chatbot_instance,
+            thread_id,
+            user_id,
+        )
+        return future.result(timeout=timeout_seconds)
+    except FuturesTimeoutError:
+        logger.warning(
+            "History message reconstruction timed out for user=%s thread=%s after %.2fs",
+            user_id,
+            thread_id,
+            timeout_seconds,
+        )
+    except Exception as exc:
+        logger.warning(
+            "History message reconstruction failed for user=%s thread=%s: %s",
+            user_id,
+            thread_id,
+            exc,
+        )
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+    return []
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -1247,37 +1477,56 @@ def health() -> dict[str, str]:
 
 @app.get("/api/v1/daily-pulse/questions")
 def get_daily_pulse_questions(raw_request: Request) -> dict[str, Any]:
-    _get_request_user(raw_request)
-
-    faq_path = os.path.join(BACKEND_DIR, "FAQ.csv")
-    if not os.path.exists(faq_path):
-        raise HTTPException(status_code=404, detail="FAQ.csv not found")
+    current_user = _get_request_user(raw_request)
+    current_user_id = current_user["user_id"]
 
     questions: list[str] = []
     try:
-        with open(faq_path, "r", encoding="utf-8-sig", newline="") as csv_file:
-            reader = csv.DictReader(csv_file)
-            if not reader.fieldnames:
-                return {"questions": [], "count": 0}
+        with db_lock:
+            rows = _db_execute(
+                """
+                SELECT question
+                FROM daily_pulse_questions
+                WHERE user_id=%s
+                ORDER BY order_index ASC, created_at ASC
+                """,
+                (current_user_id,),
+            ).fetchall()
+            questions = [str(row[0]).strip() for row in rows if row and str(row[0]).strip()]
 
-            field_map = {str(name).strip().lower(): str(name) for name in reader.fieldnames if name}
-            question_field = field_map.get("questions")
-            if not question_field:
-                raise HTTPException(
-                    status_code=400,
-                    detail="FAQ.csv is missing a 'Questions' column",
-                )
-
-            for row in reader:
-                if not isinstance(row, dict):
-                    continue
-                value = str(row.get(question_field, "")).strip()
-                if value:
-                    questions.append(value)
+            if not questions:
+                now_iso = datetime.now(UTC).isoformat()
+                for index, question in enumerate(DEFAULT_DAILY_PULSE_QUESTIONS):
+                    _db_execute(
+                        """
+                        INSERT INTO daily_pulse_questions (
+                            user_id,
+                            question,
+                            order_index,
+                            created_at,
+                            updated_at
+                        )
+                        VALUES (%s, %s, %s, %s, %s)
+                        """,
+                        (current_user_id, question, index, now_iso, now_iso),
+                    )
+                _db_commit()
+                questions = list(DEFAULT_DAILY_PULSE_QUESTIONS)
     except HTTPException:
         raise
+    except psycopg.errors.UndefinedTable:
+        with db_lock:
+            if pg_conn is not None:
+                pg_conn.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "daily_pulse_questions table is missing. "
+                "Run the manual SQL migration before using this endpoint."
+            ),
+        )
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Failed to read FAQ.csv: {exc}")
+        raise HTTPException(status_code=500, detail=f"Failed to read daily pulse questions: {exc}")
 
     return {"questions": questions, "count": len(questions)}
 
@@ -1287,9 +1536,8 @@ def update_daily_pulse_questions(
     request: DailyPulseUpdateRequest,
     raw_request: Request,
 ) -> dict[str, Any]:
-    _get_request_user(raw_request)
-
-    faq_path = os.path.join(BACKEND_DIR, "FAQ.csv")
+    current_user = _get_request_user(raw_request)
+    current_user_id = current_user["user_id"]
 
     normalized = [
         str(question).strip()
@@ -1302,13 +1550,43 @@ def update_daily_pulse_questions(
         raise HTTPException(status_code=400, detail="At least one question is required")
 
     try:
-        with open(faq_path, "w", encoding="utf-8-sig", newline="") as csv_file:
-            writer = csv.DictWriter(csv_file, fieldnames=["Questions"])
-            writer.writeheader()
-            for question in deduped:
-                writer.writerow({"Questions": question})
+        now_iso = datetime.now(UTC).isoformat()
+        with db_lock:
+            _db_execute(
+                "DELETE FROM daily_pulse_questions WHERE user_id=%s",
+                (current_user_id,),
+            )
+            for index, question in enumerate(deduped):
+                _db_execute(
+                    """
+                    INSERT INTO daily_pulse_questions (
+                        user_id,
+                        question,
+                        order_index,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES (%s, %s, %s, %s, %s)
+                    """,
+                    (current_user_id, question, index, now_iso, now_iso),
+                )
+            _db_commit()
+    except psycopg.errors.UndefinedTable:
+        with db_lock:
+            if pg_conn is not None:
+                pg_conn.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "daily_pulse_questions table is missing. "
+                "Run the manual SQL migration before using this endpoint."
+            ),
+        )
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Failed to update FAQ.csv: {exc}")
+        with db_lock:
+            if pg_conn is not None:
+                pg_conn.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to update daily pulse questions: {exc}")
 
     return {"questions": deduped, "count": len(deduped)}
 
@@ -1862,11 +2140,48 @@ def get_history(
     ending_before: Optional[str] = None,
     q: Optional[str] = None,
 ) -> dict[str, Any]:
+    started_at = time.perf_counter()
     current_user = _get_request_user(raw_request)
     current_user_id = current_user["user_id"]
-    chatbot_instance = _get_chatbot()
 
-    thread_ids = _list_visible_threads(chatbot_instance, current_user_id)
+    normalized_q = q.strip() if q else None
+    normalized_limit = max(1, limit)
+
+    # Hot path optimization: first page without search should stay SQL-limited.
+    if not ending_before and not normalized_q:
+        with db_lock:
+            rows = _db_execute(
+                """
+                                SELECT r.thread_id, r.created_at, r.title
+                FROM thread_registry r
+                                WHERE r.user_id=%s AND COALESCE(r.is_hidden, FALSE)=FALSE
+                ORDER BY r.created_at DESC
+                LIMIT %s
+                """,
+                (current_user_id, normalized_limit + 1),
+            ).fetchall()
+
+        page_rows = rows[:normalized_limit]
+        has_more = len(rows) > normalized_limit
+        chats = [
+            {
+                "id": str(row[0]),
+                "createdAt": _coerce_thread_created_at(str(row[0]), row[1]).isoformat(),
+                "title": (str(row[2] or "").strip() or "Current conversation"),
+                "userId": current_user_id,
+                "visibility": "private",
+            }
+            for row in page_rows
+            if row and row[0]
+        ]
+
+        elapsed_ms = (time.perf_counter() - started_at) * 1000
+        if elapsed_ms > 1500:
+            logger.warning("Slow /api/v1/history user=%s elapsed_ms=%.1f", current_user_id, elapsed_ms)
+        return {"chats": chats, "hasMore": has_more}
+
+    # Keep list endpoint DB-first; avoid expensive checkpoint hydration for titles.
+    thread_ids = _list_visible_threads(None, current_user_id)
     thread_meta: dict[str, dict[str, Any]] = {}
     with db_lock:
         registry_rows = _db_execute(
@@ -1881,9 +2196,8 @@ def get_history(
             "title": row[2],
         }
 
-    normalized_q = q.strip() if q else None
-
     if normalized_q and len(normalized_q) >= 2:
+        chatbot_instance = _get_chatbot()
         thread_ids = [
             thread_id
             for thread_id in thread_ids
@@ -1893,9 +2207,7 @@ def get_history(
     sorted_threads = sorted(
         thread_ids,
         key=lambda thread_id: (
-            datetime.fromisoformat(str(thread_meta.get(thread_id, {}).get("created_at")))
-            if thread_meta.get(thread_id, {}).get("created_at")
-            else _extract_thread_timestamp(thread_id)
+            _coerce_thread_created_at(thread_id, thread_meta.get(thread_id, {}).get("created_at"))
         ),
         reverse=True,
     )
@@ -1907,46 +2219,79 @@ def get_history(
         except ValueError:
             start_index = 0
 
-    page = sorted_threads[start_index : start_index + max(1, limit)]
-    has_more = start_index + max(1, limit) < len(sorted_threads)
+    page = sorted_threads[start_index : start_index + normalized_limit]
+    has_more = start_index + normalized_limit < len(sorted_threads)
 
     chats = [
         {
             "id": thread_id,
             "createdAt": (
-                datetime.fromisoformat(str(thread_meta.get(thread_id, {}).get("created_at"))).isoformat()
-                if thread_meta.get(thread_id, {}).get("created_at")
-                else _extract_thread_timestamp(thread_id).isoformat()
+                _coerce_thread_created_at(
+                    thread_id,
+                    thread_meta.get(thread_id, {}).get("created_at"),
+                ).isoformat()
             ),
-            "title": (
-                str(thread_meta.get(thread_id, {}).get("title") or "").strip()
-                or _get_thread_title(chatbot_instance, thread_id, current_user_id)
-            ),
+            "title": (str(thread_meta.get(thread_id, {}).get("title") or "").strip() or "Current conversation"),
             "userId": current_user_id,
             "visibility": "private",
         }
         for thread_id in page
     ]
 
+    elapsed_ms = (time.perf_counter() - started_at) * 1000
+    if elapsed_ms > 1500:
+        logger.warning("Slow /api/v1/history user=%s elapsed_ms=%.1f", current_user_id, elapsed_ms)
+
     return {"chats": chats, "hasMore": has_more}
 
 
 @app.get("/api/v1/history/{thread_id}")
 def get_history_messages(thread_id: str, raw_request: Request) -> dict[str, Any]:
+    started_at = time.perf_counter()
     current_user = _get_request_user(raw_request)
     current_user_id = current_user["user_id"]
-    chatbot_instance = _get_chatbot()
-    if not _is_thread_visible(chatbot_instance, thread_id, current_user_id):
+    if not _is_thread_visible(None, thread_id, current_user_id):
         raise HTTPException(status_code=404, detail="Thread not found")
 
     # Fast path for UI refresh: prefer persisted stream cache when available.
     cached_messages = _load_cached_messages(thread_id, current_user_id)
     if cached_messages:
+        elapsed_ms = (time.perf_counter() - started_at) * 1000
+        if elapsed_ms > 1500:
+            logger.warning(
+                "Slow /api/v1/history/{thread_id} cache-hit user=%s thread=%s elapsed_ms=%.1f",
+                current_user_id,
+                thread_id,
+                elapsed_ms,
+            )
         return {"messages": cached_messages}
 
-    serialized = _serialize_thread_messages(chatbot_instance, thread_id, current_user_id)
+    chatbot_instance = _get_chatbot()
+    serialized = _serialize_thread_messages_with_timeout(
+        chatbot_instance,
+        thread_id,
+        current_user_id,
+    )
     if serialized:
+        _save_cached_messages(thread_id, current_user_id, serialized)
+        elapsed_ms = (time.perf_counter() - started_at) * 1000
+        if elapsed_ms > 1500:
+            logger.warning(
+                "Slow /api/v1/history/{thread_id} rebuilt user=%s thread=%s elapsed_ms=%.1f",
+                current_user_id,
+                thread_id,
+                elapsed_ms,
+            )
         return {"messages": serialized}
+
+    elapsed_ms = (time.perf_counter() - started_at) * 1000
+    if elapsed_ms > 1500:
+        logger.warning(
+            "Slow /api/v1/history/{thread_id} empty user=%s thread=%s elapsed_ms=%.1f",
+            current_user_id,
+            thread_id,
+            elapsed_ms,
+        )
 
     return {"messages": []}
 
@@ -1955,19 +2300,16 @@ def get_history_messages(thread_id: str, raw_request: Request) -> dict[str, Any]
 def delete_all_history(raw_request: Request) -> dict[str, bool]:
     current_user = _get_request_user(raw_request)
     current_user_id = current_user["user_id"]
-    chatbot_instance = _get_chatbot()
-    thread_ids = _list_visible_threads(chatbot_instance, current_user_id)
 
     with db_lock:
-        for thread_id in thread_ids:
-            _db_execute(
-                """
-                INSERT INTO hidden_threads (user_id, thread_id, hidden_at)
-                VALUES (%s, %s, %s)
-                ON CONFLICT (user_id, thread_id) DO NOTHING
-                """,
-                (current_user_id, thread_id, datetime.now(UTC).isoformat()),
-            )
+        _db_execute(
+            """
+            UPDATE thread_registry
+            SET is_hidden=TRUE, hidden_at=%s
+            WHERE user_id=%s AND COALESCE(is_hidden, FALSE)=FALSE
+            """,
+            (datetime.now(UTC).isoformat(), current_user_id),
+        )
         pg_conn.commit()
     return {"success": True}
 
@@ -1976,18 +2318,17 @@ def delete_all_history(raw_request: Request) -> dict[str, bool]:
 def delete_history(thread_id: str, raw_request: Request) -> dict[str, bool]:
     current_user = _get_request_user(raw_request)
     current_user_id = current_user["user_id"]
-    chatbot_instance = _get_chatbot()
-    if not _is_thread_visible(chatbot_instance, thread_id, current_user_id):
+    if not _is_thread_visible(None, thread_id, current_user_id):
         raise HTTPException(status_code=404, detail="Thread not found")
 
     with db_lock:
         _db_execute(
             """
-            INSERT INTO hidden_threads (user_id, thread_id, hidden_at)
-            VALUES (%s, %s, %s)
-            ON CONFLICT (user_id, thread_id) DO NOTHING
+            UPDATE thread_registry
+            SET is_hidden=TRUE, hidden_at=%s
+            WHERE user_id=%s AND thread_id=%s
             """,
-            (current_user_id, thread_id, datetime.now(UTC).isoformat()),
+            (datetime.now(UTC).isoformat(), current_user_id, thread_id),
         )
         _db_execute(
             "DELETE FROM message_feedback WHERE user_id=%s AND thread_id=%s",
@@ -2001,8 +2342,7 @@ def delete_history(thread_id: str, raw_request: Request) -> dict[str, bool]:
 def get_votes(thread_id: str, raw_request: Request) -> list[dict[str, Any]]:
     current_user = _get_request_user(raw_request)
     current_user_id = current_user["user_id"]
-    chatbot_instance = _get_chatbot()
-    if not _is_thread_visible(chatbot_instance, thread_id, current_user_id):
+    if not _is_thread_visible(None, thread_id, current_user_id):
         raise HTTPException(status_code=404, detail="Thread not found")
 
     with db_lock:
@@ -2033,8 +2373,7 @@ def get_votes(thread_id: str, raw_request: Request) -> list[dict[str, Any]]:
 def save_vote(request: VoteRequest, raw_request: Request) -> dict[str, Any]:
     current_user = _get_request_user(raw_request)
     current_user_id = current_user["user_id"]
-    chatbot_instance = _get_chatbot()
-    if not _is_thread_visible(chatbot_instance, request.thread_id, current_user_id):
+    if not _is_thread_visible(None, request.thread_id, current_user_id):
         raise HTTPException(status_code=404, detail="Thread not found")
 
     inserted = _save_feedback_if_missing(request, current_user_id)

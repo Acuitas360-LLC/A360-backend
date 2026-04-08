@@ -2483,5 +2483,26 @@
         "text": "import plotly.graph_objects as go\n\nvalue = df[\"UNIQUE_WEEKS\"].iloc[0]\n\nfig = go.Figure(\n    go.Indicator(\n        mode=\"number\",\n        value=value,\n        number={\"valueformat\": \",d\"},\n        title={\"text\": \"Unique weeks with drug sales data\"}\n    )\n)\n\nfig.update_layout(\n    margin=dict(l=40, r=40, t=80, b=40),\n    height=350\n)"
       }
     ]
+  },
+  {
+    "run_id": "2026-04-08T08:04:30.780677+00:00Z",
+    "question": "How many unique weeks of drug sales are available in the data?",
+    "trace": [
+      {
+        "agent": "query_decomposer",
+        "event_type": "TextMessage",
+        "text": "{\n  \"intent_summary\": \"Count the number of unique weeks of drug sales available in the dataset by counting distinct week_end_date values.\",\n  \"tables\": [\n    \"data_867\"\n  ],\n  \"filters\": [\n    {\n      \"column\": \"week_end_date\",\n      \"operator\": \"IS NOT\",\n      \"value\": \"NULL\"\n    }\n  ],\n  \"aggregations\": [\n    {\n      \"metric_name\": \"unique_weeks\",\n      \"function\": \"COUNT\",\n      \"column\": \"week_end_date\",\n      \"group_level\": \"none\"\n    }\n  ],\n  \"subqueries\": [\n    {\n      \"name\": \"distinct_weeks_cte\",\n      \"purpose\": \"Derive one row per unique week present in the data to enable an accurate distinct-week count.\",\n      \"logic\": \"Select DISTINCT week_end_date from data_867 where week_end_date is not NULL.\"\n    }\n  ],\n  \"group_by\": [],\n  \"order_by\": [],\n  \"limit\": null,\n  \"final_output\": {\n    \"columns\": [\n      \"unique_weeks\"\n    ],\n    \"row_granularity\": \"single_row\"\n  },\n  \"validation_rules\": [\n    \"Use data_867 as the anchor table for sales-related questions.\",\n    \"Use week_end_date as the unique week identifier for weekly calculations.\",\n    \"Count must reflect DISTINCT week_end_date values (do not count rows).\",\n    \"Exclude NULL week_end_date values.\",\n    \"Do not apply any additional time window restriction; the question asks for all data available.\"\n  ],\n  \"rag_alignment\": {\n    \"rag_provided\": true,\n    \"used_examples\": [\n      \"Example #1\"\n    ],\n    \"borrowed_patterns\": [\n      \"CTE that selects distinct week_end_date values and then counts them\",\n      \"No additional filters beyond excluding NULL week_end_date\",\n      \"Single-row output with a single metric column named unique_weeks\"\n    ],\n    \"differences_from_examples\": [\n      \"Used data_867 instead of drug_sales to match the provided schema.\"\n    ]\n  }\n}"
+      },
+      {
+        "agent": "SQL_Generator",
+        "event_type": "TextMessage",
+        "text": "WITH distinct_weeks_cte AS (\n  SELECT DISTINCT week_end_date\n  FROM data_867\n  WHERE week_end_date IS NOT NULL\n)\nSELECT COUNT(*) AS unique_weeks\nFROM distinct_weeks_cte;"
+      },
+      {
+        "agent": "visualization_node",
+        "event_type": "TextMessage",
+        "text": "import plotly.graph_objects as go\n\nvalue = df[\"UNIQUE_WEEKS\"].iloc[0] if \"UNIQUE_WEEKS\" in df.columns and len(df) else None\n\nfig = go.Figure(\n    data=[\n        go.Indicator(\n            mode=\"number\",\n            value=value,\n            number={\"valueformat\": \",d\"},\n            title={\"text\": \"Unique Weeks of Drug Sales (Distinct week_end_date)\"},\n        )\n    ]\n)\n\nfig.update_layout(\n    template=\"plotly_white\",\n    height=300,\n    margin=dict(l=30, r=30, t=70, b=30),\n)"
+      }
+    ]
   }
 ]
