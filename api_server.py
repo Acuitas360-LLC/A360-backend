@@ -1716,6 +1716,61 @@ async def chat_stream(request: ChatRequest, raw_request: Request) -> StreamingRe
             except Exception:
                 return False
 
+        def _persist_stream_messages(always: bool = False) -> None:
+            has_materialized_content = any(
+                [
+                    bool(final_summary_text.strip()),
+                    bool(final_sql_query),
+                    isinstance(final_sql_result, dict),
+                    bool(final_visualization_code),
+                    isinstance(final_visualization_figure, dict),
+                    bool(relevant_questions),
+                ]
+            )
+
+            if not always and not has_materialized_content:
+                return
+
+            cached_messages = _load_cached_messages(request.thread_id, current_user_id)
+            user_message = {
+                "id": str(uuid.uuid4()),
+                "role": "user",
+                "parts": [{"type": "text", "text": request.question}],
+            }
+            assistant_parts: list[dict[str, Any]] = [
+                {
+                    "type": "text",
+                    "text": final_summary_text or "Completed",
+                }
+            ]
+            if final_summary_text:
+                assistant_parts.append({"type": "data-resultSummary", "data": final_summary_text})
+            if final_sql_query:
+                assistant_parts.append({"type": "data-sqlQuery", "data": final_sql_query})
+            if isinstance(final_sql_result, dict):
+                assistant_parts.append({"type": "data-sqlResult", "data": final_sql_result})
+                columns = final_sql_result.get("columns")
+                if isinstance(columns, list) and columns:
+                    assistant_parts.append({"type": "data-sqlColumns", "data": columns})
+                rows = final_sql_result.get("data")
+                if isinstance(rows, list):
+                    assistant_parts.append({"type": "data-sqlRowCount", "data": len(rows)})
+            if final_visualization_code:
+                assistant_parts.append({"type": "data-visualizationCode", "data": final_visualization_code})
+            if isinstance(final_visualization_figure, dict):
+                assistant_parts.append({"type": "data-visualizationFigure", "data": final_visualization_figure})
+            if relevant_questions:
+                assistant_parts.append({"type": "data-relevantQuestions", "data": relevant_questions})
+
+            assistant_message = {
+                "id": str(uuid.uuid4()),
+                "role": "assistant",
+                "parts": assistant_parts,
+            }
+
+            cached_messages.extend([user_message, assistant_message])
+            _save_cached_messages(request.thread_id, current_user_id, cached_messages)
+
         try:
             yield _sse_event(
                 "status",
@@ -2015,53 +2070,20 @@ async def chat_stream(request: ChatRequest, raw_request: Request) -> StreamingRe
                     {"relevant_questions": relevant_questions},
                 )
 
+            # Persist stream conversation so refresh/history works even when
+            # this path does not write wrapper-checkpoint messages.
+
+            _persist_stream_messages(always=True)
+
             if await _client_disconnected():
                 return
 
-            # Persist stream conversation so refresh/history works even when
-            # this path does not write wrapper-checkpoint messages.
-            cached_messages = _load_cached_messages(request.thread_id, current_user_id)
-            user_message = {
-                "id": str(uuid.uuid4()),
-                "role": "user",
-                "parts": [{"type": "text", "text": request.question}],
-            }
-            assistant_parts: list[dict[str, Any]] = [
-                {
-                    "type": "text",
-                    "text": final_summary_text or "Completed",
-                }
-            ]
-            if final_summary_text:
-                assistant_parts.append({"type": "data-resultSummary", "data": final_summary_text})
-            if final_sql_query:
-                assistant_parts.append({"type": "data-sqlQuery", "data": final_sql_query})
-            if isinstance(final_sql_result, dict):
-                assistant_parts.append({"type": "data-sqlResult", "data": final_sql_result})
-                columns = final_sql_result.get("columns")
-                if isinstance(columns, list) and columns:
-                    assistant_parts.append({"type": "data-sqlColumns", "data": columns})
-                rows = final_sql_result.get("data")
-                if isinstance(rows, list):
-                    assistant_parts.append({"type": "data-sqlRowCount", "data": len(rows)})
-            if final_visualization_code:
-                assistant_parts.append({"type": "data-visualizationCode", "data": final_visualization_code})
-            if isinstance(final_visualization_figure, dict):
-                assistant_parts.append({"type": "data-visualizationFigure", "data": final_visualization_figure})
-            if relevant_questions:
-                assistant_parts.append({"type": "data-relevantQuestions", "data": relevant_questions})
-
-            assistant_message = {
-                "id": str(uuid.uuid4()),
-                "role": "assistant",
-                "parts": assistant_parts,
-            }
-
-            cached_messages.extend([user_message, assistant_message])
-            _save_cached_messages(request.thread_id, current_user_id, cached_messages)
-
             yield _sse_event("complete", {"thread_id": request.thread_id})
         except asyncio.CancelledError:
+            try:
+                _persist_stream_messages(always=False)
+            except Exception:
+                pass
             return
         except HTTPException as exc:
             yield _sse_event(
@@ -2075,44 +2097,7 @@ async def chat_stream(request: ChatRequest, raw_request: Request) -> StreamingRe
             # If we already produced visible assistant content before the
             # stream failed, persist a best-effort message for refresh/history.
             if final_summary_text.strip():
-                cached_messages = _load_cached_messages(request.thread_id, current_user_id)
-                user_message = {
-                    "id": str(uuid.uuid4()),
-                    "role": "user",
-                    "parts": [{"type": "text", "text": request.question}],
-                }
-                assistant_parts: list[dict[str, Any]] = [
-                    {
-                        "type": "text",
-                        "text": final_summary_text,
-                    },
-                    {"type": "data-resultSummary", "data": final_summary_text},
-                ]
-                if final_sql_query:
-                    assistant_parts.append({"type": "data-sqlQuery", "data": final_sql_query})
-                if isinstance(final_sql_result, dict):
-                    assistant_parts.append({"type": "data-sqlResult", "data": final_sql_result})
-                    columns = final_sql_result.get("columns")
-                    if isinstance(columns, list) and columns:
-                        assistant_parts.append({"type": "data-sqlColumns", "data": columns})
-                    rows = final_sql_result.get("data")
-                    if isinstance(rows, list):
-                        assistant_parts.append({"type": "data-sqlRowCount", "data": len(rows)})
-                if final_visualization_code:
-                    assistant_parts.append({"type": "data-visualizationCode", "data": final_visualization_code})
-                if isinstance(final_visualization_figure, dict):
-                    assistant_parts.append({"type": "data-visualizationFigure", "data": final_visualization_figure})
-                if relevant_questions:
-                    assistant_parts.append({"type": "data-relevantQuestions", "data": relevant_questions})
-
-                assistant_message = {
-                    "id": str(uuid.uuid4()),
-                    "role": "assistant",
-                    "parts": assistant_parts,
-                }
-
-                cached_messages.extend([user_message, assistant_message])
-                _save_cached_messages(request.thread_id, current_user_id, cached_messages)
+                _persist_stream_messages(always=False)
 
             yield _sse_event(
                 "error",
