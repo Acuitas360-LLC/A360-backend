@@ -6,6 +6,7 @@ import sys
 import uuid
 import json
 import asyncio
+import random
 import threading
 import logging
 import time
@@ -16,6 +17,7 @@ from typing import Any, Optional
 import jwt
 from jwt import PyJWKClient
 import psycopg
+from psycopg_pool import ConnectionPool, PoolTimeout
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -86,7 +88,7 @@ DEFAULT_DAILY_PULSE_QUESTIONS: tuple[str, ...] = (
 app = FastAPI(title="A360 Backend API", version="0.1.0")
 
 
-DB_WARMUP_ON_STARTUP = os.getenv("DB_WARMUP_ON_STARTUP", "1").strip().lower() in {
+DB_WARMUP_ON_STARTUP = os.getenv("DB_WARMUP_ON_STARTUP", "0").strip().lower() in {
     "1",
     "true",
     "yes",
@@ -614,99 +616,453 @@ def _init_feedback_db(conn: psycopg.Connection) -> None:
     conn.commit()
 
 
-pg_conn: Optional[psycopg.Connection] = None
-db_lock = threading.Lock()
-db_schema_ready = False
+db_pool: Optional[ConnectionPool] = None
+checkpointer_conn: Optional[psycopg.Connection] = None
 db_unavailable_until: Optional[datetime] = None
+db_ready = False
+db_last_error: Optional[str] = None
+db_last_success_at: Optional[str] = None
+db_retry_attempts = 0
+db_retry_task: Optional[asyncio.Task[Any]] = None
+db_retry_task_running = False
+
+_ENSURED_TABLES: set[str] = set()
+_ENSURE_TABLES_LOCK = threading.Lock()
+
+
+def _log_db_event(event: str, level: int = logging.INFO, **fields: Any) -> None:
+    parts = [f"event={event}"]
+    for key, value in fields.items():
+        if value is None:
+            continue
+        parts.append(f"{key}={value}")
+    logger.log(level, " ".join(parts))
+
+
+def _mark_db_ready_state(ready: bool, error: Optional[str] = None) -> None:
+    global db_ready
+    global db_last_error
+    global db_last_success_at
+
+    if db_ready != ready:
+        _log_db_event("db.ready_state_changed", ready=ready, error=error)
+
+    db_ready = ready
+    if ready:
+        db_last_error = None
+        db_last_success_at = datetime.now(UTC).isoformat()
+    elif error:
+        db_last_error = error
+
+
+def _extract_missing_relation(exc: Exception) -> Optional[str]:
+    table_name = getattr(getattr(exc, "diag", None), "table_name", None)
+    if isinstance(table_name, str) and table_name.strip():
+        return table_name.strip()
+
+    message = str(exc)
+    match = re.search(r'relation\s+"([^"]+)"\s+does not exist', message, re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
+    return None
+
+
+def _table_ensure_statements(table_name: str) -> list[str]:
+    table_map: dict[str, list[str]] = {
+        "thread_registry": [
+            """
+            CREATE TABLE IF NOT EXISTS thread_registry (
+                user_id TEXT,
+                thread_id TEXT,
+                created_at TEXT,
+                title TEXT,
+                is_hidden BOOLEAN,
+                hidden_at TEXT
+            )
+            """,
+            "ALTER TABLE thread_registry ADD COLUMN IF NOT EXISTS is_hidden BOOLEAN",
+            "ALTER TABLE thread_registry ADD COLUMN IF NOT EXISTS hidden_at TEXT",
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS thread_registry_user_thread_unique
+            ON thread_registry (user_id, thread_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS thread_registry_user_hidden_created_idx
+            ON thread_registry (user_id, is_hidden, created_at)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS thread_registry_user_created_idx
+            ON thread_registry (user_id, created_at)
+            """,
+        ],
+        "thread_message_cache": [
+            """
+            CREATE TABLE IF NOT EXISTS thread_message_cache (
+                user_id TEXT,
+                thread_id TEXT,
+                messages_json TEXT NOT NULL,
+                updated_at TEXT
+            )
+            """,
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS thread_message_cache_user_thread_unique
+            ON thread_message_cache (user_id, thread_id)
+            """,
+        ],
+        "message_feedback": [
+            """
+            CREATE TABLE IF NOT EXISTS message_feedback (
+                id SERIAL PRIMARY KEY,
+                user_id TEXT,
+                thread_id TEXT,
+                message_id TEXT,
+                user_query TEXT,
+                assistant_response TEXT,
+                rating INTEGER,
+                created_at TEXT
+            )
+            """,
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS message_feedback_user_thread_message_unique
+            ON message_feedback (user_id, thread_id, message_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS message_feedback_user_thread_idx
+            ON message_feedback (user_id, thread_id)
+            """,
+        ],
+        "daily_pulse_questions": [
+            """
+            CREATE TABLE IF NOT EXISTS daily_pulse_questions (
+                user_id TEXT NOT NULL,
+                question TEXT NOT NULL,
+                order_index INTEGER NOT NULL,
+                created_at TEXT,
+                updated_at TEXT
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS daily_pulse_questions_user_idx
+            ON daily_pulse_questions (user_id)
+            """,
+        ],
+    }
+    return table_map.get(table_name, [])
+
+
+def _ensure_table_if_needed(table_name: str) -> bool:
+    if not table_name:
+        return False
+
+    if table_name in _ENSURED_TABLES:
+        return True
+
+    statements = _table_ensure_statements(table_name)
+    if not statements:
+        return False
+
+    with _ENSURE_TABLES_LOCK:
+        if table_name in _ENSURED_TABLES:
+            return True
+
+        _log_db_event("db.ensure_table_started", table=table_name)
+        try:
+            pool = _ensure_db_pool()
+            with pool.connection() as conn:
+                for statement in statements:
+                    conn.execute(statement)
+            _ENSURED_TABLES.add(table_name)
+            _log_db_event("db.ensure_table_success", table=table_name)
+            return True
+        except Exception as exc:
+            _log_db_event(
+                "db.ensure_table_failed",
+                level=logging.WARNING,
+                table=table_name,
+                error_class=exc.__class__.__name__,
+                error=str(exc),
+            )
+            return False
+
+
+def _record_db_failure(exc: Exception) -> None:
+    global db_unavailable_until
+
+    db_unavailable_until = datetime.now(UTC) + timedelta(seconds=DB_UNAVAILABLE_COOLDOWN_SECONDS)
+    _mark_db_ready_state(False, error=str(exc))
+    _log_db_event(
+        "db.connection_failure",
+        level=logging.WARNING,
+        error_class=exc.__class__.__name__,
+        error=str(exc),
+    )
 
 
 @app.on_event("startup")
 async def _startup_db_warmup() -> None:
-    if not DB_WARMUP_ON_STARTUP:
-        logger.info("DB warmup skipped (DB_WARMUP_ON_STARTUP disabled)")
+    global db_retry_task
+    global db_retry_task_running
+
+    if db_retry_task_running:
         return
 
-    started_at = time.perf_counter()
+    db_retry_task_running = True
+    db_retry_task = asyncio.create_task(_db_retry_loop(), name="db-retry-loop")
+    _log_db_event("db.startup_retry_started", warmup_enabled=DB_WARMUP_ON_STARTUP)
+
+
+async def _db_retry_loop() -> None:
+    global db_retry_attempts
+
+    base_delay = 1.0
+    max_delay = 30.0
+    delay = base_delay
+
+    while True:
+        db_retry_attempts += 1
+        attempt = db_retry_attempts
+        _log_db_event("db.startup_retry_attempt", attempt=attempt, delay_s=round(delay, 2))
+        try:
+            _ensure_db_pool()
+            _mark_db_ready_state(True)
+            _log_db_event("db.startup_retry_success", attempt=attempt)
+            delay = base_delay
+            await asyncio.sleep(60.0)
+            continue
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            _record_db_failure(exc)
+            _log_db_event(
+                "db.startup_retry_failed",
+                level=logging.WARNING,
+                attempt=attempt,
+                error_class=exc.__class__.__name__,
+                error=str(exc),
+            )
+
+        jitter_factor = 1.0 + random.uniform(-0.2, 0.2)
+        await asyncio.sleep(max(0.5, delay * jitter_factor))
+        delay = min(max_delay, delay * 2)
+
+
+@app.on_event("shutdown")
+async def _shutdown_db_connections() -> None:
+    global db_pool
+    global checkpointer_conn
+    global db_retry_task
+    global db_retry_task_running
+
+    db_retry_task_running = False
+    if db_retry_task is not None:
+        db_retry_task.cancel()
+        try:
+            await db_retry_task
+        except asyncio.CancelledError:
+            pass
+        finally:
+            db_retry_task = None
+
+    if db_pool is not None:
+        try:
+            db_pool.close()
+        finally:
+            db_pool = None
+
+    if checkpointer_conn is not None:
+        try:
+            checkpointer_conn.close()
+        finally:
+            checkpointer_conn = None
+
+
+def _configure_runtime_connection(conn: psycopg.Connection) -> None:
+    # Pool configure callback must leave connections idle (not INTRANS).
+    previous_autocommit = conn.autocommit
     try:
-        with db_lock:
-            _ensure_db_connection()
+        conn.autocommit = True
+        conn.execute(f"SET statement_timeout = {DB_STATEMENT_TIMEOUT_MS}")
+    finally:
+        conn.autocommit = previous_autocommit
+
+
+def _ensure_db_pool() -> ConnectionPool:
+    global db_pool
+    global db_unavailable_until
+
+    if db_pool is not None:
+        return db_pool
+
+    try:
+        pool = ConnectionPool(
+            conninfo=DB_URI,
+            min_size=max(1, int(os.getenv("DB_POOL_MIN_SIZE", "1"))),
+            max_size=max(1, int(os.getenv("DB_POOL_MAX_SIZE", "10"))),
+            timeout=DB_CONNECT_TIMEOUT,
+            configure=_configure_runtime_connection,
+            kwargs={
+                "autocommit": False,
+                "connect_timeout": DB_CONNECT_TIMEOUT,
+            },
+            open=True,
+        )
+        db_pool = pool
+        db_unavailable_until = None
+        return pool
     except Exception as exc:
-        elapsed_ms = (time.perf_counter() - started_at) * 1000
-        logger.warning("DB warmup failed elapsed_ms=%.1f err=%s", elapsed_ms, exc)
-        return
-
-    elapsed_ms = (time.perf_counter() - started_at) * 1000
-    logger.info("DB warmup complete elapsed_ms=%.1f schema_ready=%s", elapsed_ms, db_schema_ready)
+        _record_db_failure(exc)
+        raise
 
 
-def _ensure_db_connection() -> psycopg.Connection:
-    global pg_conn
-    global db_schema_ready
+def _ensure_checkpointer_connection() -> psycopg.Connection:
+    global checkpointer_conn
 
-    if pg_conn is not None:
-        return pg_conn
+    if checkpointer_conn is not None:
+        return checkpointer_conn
 
-    pg_conn = psycopg.connect(DB_URI, autocommit=False, connect_timeout=DB_CONNECT_TIMEOUT)
-    if not db_schema_ready:
-        # Allow bootstrap/migration work to complete once with a wider timeout window.
-        pg_conn.execute(f"SET statement_timeout = {DB_BOOTSTRAP_STATEMENT_TIMEOUT_MS}")
-        _init_feedback_db(pg_conn)
-        db_schema_ready = True
-    # Runtime timeout for request queries to keep UI endpoints responsive.
-    pg_conn.execute(f"SET statement_timeout = {DB_STATEMENT_TIMEOUT_MS}")
-    return pg_conn
+    checkpointer_conn = psycopg.connect(
+        DB_URI,
+        autocommit=False,
+        connect_timeout=DB_CONNECT_TIMEOUT,
+    )
+    checkpointer_conn.execute(f"SET statement_timeout = {DB_STATEMENT_TIMEOUT_MS}")
+    checkpointer_conn.commit()
+    return checkpointer_conn
 
 
-def _db_commit() -> None:
-    _ensure_db_connection().commit()
-
-
-def _db_execute(query: str, params: Optional[tuple[Any, ...]] = None) -> Any:
-    global pg_conn
-    global db_schema_ready
+def _db_fetchall(query: str, params: Optional[tuple[Any, ...]] = None) -> list[Any]:
     global db_unavailable_until
 
     now = datetime.now(UTC)
     if db_unavailable_until and now < db_unavailable_until:
         raise DatabaseUnavailableError("PostgreSQL connection is unavailable")
 
+    ensured_missing_table = False
     for attempt in (1, 2):
         try:
-            conn = _ensure_db_connection()
-            db_unavailable_until = None
-            if params is None:
-                return conn.execute(query)
-            return conn.execute(query, params)
+            pool = _ensure_db_pool()
+            with pool.connection() as conn:
+                db_unavailable_until = None
+                cursor = conn.execute(query, params) if params is not None else conn.execute(query)
+                _mark_db_ready_state(True)
+                return cursor.fetchall()
+        except psycopg.errors.UndefinedTable as exc:
+            table_name = _extract_missing_relation(exc)
+            _log_db_event(
+                "db.undefined_table_detected",
+                level=logging.WARNING,
+                table=table_name,
+                query_preview=query.strip().splitlines()[0][:120] if query else "",
+            )
+            if ensured_missing_table or not table_name or not _ensure_table_if_needed(table_name):
+                raise DatabaseUnavailableError("Required database table is missing") from exc
+            ensured_missing_table = True
+            _log_db_event("db.query_retry_after_ensure", table=table_name)
+            continue
         except psycopg.errors.InFailedSqlTransaction as exc:
-            # Recover from a previously failed statement in the same transaction.
-            try:
-                if pg_conn is not None:
-                    pg_conn.rollback()
-            except Exception:
-                pass
             if attempt == 1:
                 continue
             raise DatabaseUnavailableError("PostgreSQL transaction is in failed state") from exc
         except psycopg.errors.QueryCanceled as exc:
-            # Statement timeout should fail fast but not poison the connection pool/cooldown.
-            try:
-                if pg_conn is not None:
-                    pg_conn.rollback()
-            except Exception:
-                pass
             logger.warning("PostgreSQL query timeout: %s", exc.__class__.__name__)
             raise DatabaseUnavailableError("PostgreSQL query timed out") from exc
-        except (psycopg.OperationalError, psycopg.InterfaceError, psycopg.errors.ConnectionTimeout) as exc:
-            try:
-                if pg_conn is not None:
-                    pg_conn.close()
-            except Exception:
-                pass
-            pg_conn = None
+        except (PoolTimeout, psycopg.OperationalError, psycopg.InterfaceError, psycopg.errors.ConnectionTimeout) as exc:
             if attempt == 1:
                 continue
-            db_unavailable_until = datetime.now(UTC) + timedelta(seconds=DB_UNAVAILABLE_COOLDOWN_SECONDS)
-            logger.warning("PostgreSQL reconnect failed: %s", exc.__class__.__name__)
+            _record_db_failure(exc)
+            raise DatabaseUnavailableError("PostgreSQL connection is unavailable") from exc
+
+    raise DatabaseUnavailableError("PostgreSQL query execution failed")
+
+
+def _db_fetchone(query: str, params: Optional[tuple[Any, ...]] = None) -> Any:
+    global db_unavailable_until
+
+    now = datetime.now(UTC)
+    if db_unavailable_until and now < db_unavailable_until:
+        raise DatabaseUnavailableError("PostgreSQL connection is unavailable")
+
+    ensured_missing_table = False
+    for attempt in (1, 2):
+        try:
+            pool = _ensure_db_pool()
+            with pool.connection() as conn:
+                db_unavailable_until = None
+                cursor = conn.execute(query, params) if params is not None else conn.execute(query)
+                _mark_db_ready_state(True)
+                return cursor.fetchone()
+        except psycopg.errors.UndefinedTable as exc:
+            table_name = _extract_missing_relation(exc)
+            _log_db_event(
+                "db.undefined_table_detected",
+                level=logging.WARNING,
+                table=table_name,
+                query_preview=query.strip().splitlines()[0][:120] if query else "",
+            )
+            if ensured_missing_table or not table_name or not _ensure_table_if_needed(table_name):
+                raise DatabaseUnavailableError("Required database table is missing") from exc
+            ensured_missing_table = True
+            _log_db_event("db.query_retry_after_ensure", table=table_name)
+            continue
+        except psycopg.errors.InFailedSqlTransaction as exc:
+            if attempt == 1:
+                continue
+            raise DatabaseUnavailableError("PostgreSQL transaction is in failed state") from exc
+        except psycopg.errors.QueryCanceled as exc:
+            logger.warning("PostgreSQL query timeout: %s", exc.__class__.__name__)
+            raise DatabaseUnavailableError("PostgreSQL query timed out") from exc
+        except (PoolTimeout, psycopg.OperationalError, psycopg.InterfaceError, psycopg.errors.ConnectionTimeout) as exc:
+            if attempt == 1:
+                continue
+            _record_db_failure(exc)
+            raise DatabaseUnavailableError("PostgreSQL connection is unavailable") from exc
+
+    raise DatabaseUnavailableError("PostgreSQL query execution failed")
+
+
+def _db_execute(query: str, params: Optional[tuple[Any, ...]] = None) -> None:
+    global db_unavailable_until
+
+    now = datetime.now(UTC)
+    if db_unavailable_until and now < db_unavailable_until:
+        raise DatabaseUnavailableError("PostgreSQL connection is unavailable")
+
+    ensured_missing_table = False
+    for attempt in (1, 2):
+        try:
+            pool = _ensure_db_pool()
+            with pool.connection() as conn:
+                db_unavailable_until = None
+                if params is None:
+                    conn.execute(query)
+                else:
+                    conn.execute(query, params)
+                _mark_db_ready_state(True)
+                return
+        except psycopg.errors.UndefinedTable as exc:
+            table_name = _extract_missing_relation(exc)
+            _log_db_event(
+                "db.undefined_table_detected",
+                level=logging.WARNING,
+                table=table_name,
+                query_preview=query.strip().splitlines()[0][:120] if query else "",
+            )
+            if ensured_missing_table or not table_name or not _ensure_table_if_needed(table_name):
+                raise DatabaseUnavailableError("Required database table is missing") from exc
+            ensured_missing_table = True
+            _log_db_event("db.query_retry_after_ensure", table=table_name)
+            continue
+        except psycopg.errors.InFailedSqlTransaction as exc:
+            if attempt == 1:
+                continue
+            raise DatabaseUnavailableError("PostgreSQL transaction is in failed state") from exc
+        except psycopg.errors.QueryCanceled as exc:
+            logger.warning("PostgreSQL query timeout: %s", exc.__class__.__name__)
+            raise DatabaseUnavailableError("PostgreSQL query timed out") from exc
+        except (PoolTimeout, psycopg.OperationalError, psycopg.InterfaceError, psycopg.errors.ConnectionTimeout) as exc:
+            if attempt == 1:
+                continue
+            _record_db_failure(exc)
             raise DatabaseUnavailableError("PostgreSQL connection is unavailable") from exc
 
     raise DatabaseUnavailableError("PostgreSQL query execution failed")
@@ -716,7 +1072,7 @@ def _build_checkpointer() -> Any:
     try:
         if PostgresSaver is None:
             return MemorySaver()
-        checkpointer_instance = PostgresSaver(_ensure_db_connection())
+        checkpointer_instance = PostgresSaver(_ensure_checkpointer_connection())
         checkpointer_instance.setup()
         return checkpointer_instance
     except Exception:
@@ -730,9 +1086,16 @@ stream_subgraph = None
 
 
 def _build_rag_examples_for_question(question: str) -> tuple[str, str, list[str]]:
-    from chatbot7 import build_rag_examples
+    from chatbot8 import build_rag_examples, get_intent_summary
 
-    return build_rag_examples(question)
+    intent = question
+    try:
+        intent = str(get_intent_summary(question)).strip() or question
+    except Exception as exc:
+        # Keep stream path resilient if intent extraction fails transiently.
+        logger.warning("Intent extraction failed for RAG examples: %s", exc)
+
+    return build_rag_examples(question, intent)
 
 
 def _get_chatbot() -> Any:
@@ -741,7 +1104,7 @@ def _get_chatbot() -> Any:
     if chatbot is None:
         if checkpointer is None:
             checkpointer = _build_checkpointer()
-        from chatbot7 import build_chatbot
+        from chatbot8 import build_chatbot
 
         chatbot = build_chatbot(checkpointer=checkpointer)
     return chatbot
@@ -750,7 +1113,7 @@ def _get_chatbot() -> Any:
 def _get_stream_subgraph() -> Any:
     global stream_subgraph
     if stream_subgraph is None:
-        from subgraph5 import build_graph as build_stream_graph
+        from subgraph_7 import build_graph as build_stream_graph
 
         stream_subgraph = build_stream_graph(checkpointer=None)
     return stream_subgraph
@@ -906,7 +1269,8 @@ def _build_plotly_figure_json(
 
     try:
         exec(code, safe_globals, safe_locals)
-    except Exception:
+    except Exception as exc:
+        logger.warning("Visualization code execution failed: %s", exc)
         return None
 
     fig = safe_locals.get("fig") or safe_globals.get("fig")
@@ -1042,39 +1406,36 @@ def _build_heuristic_plotly_figure_json(
 
 
 def _feedback_exists(user_id: str, thread_id: str, message_id: str) -> bool:
-    with db_lock:
-        cursor = _db_execute(
-            (
-                "SELECT 1 FROM message_feedback "
-                "WHERE user_id=%s AND thread_id=%s AND message_id=%s LIMIT 1"
-            ),
-            (user_id, thread_id, message_id),
-        )
-        return cursor.fetchone() is not None
+    row = _db_fetchone(
+        (
+            "SELECT 1 FROM message_feedback "
+            "WHERE user_id=%s AND thread_id=%s AND message_id=%s LIMIT 1"
+        ),
+        (user_id, thread_id, message_id),
+    )
+    return row is not None
 
 
 def _save_feedback_if_missing(request: VoteRequest, user_id: str) -> bool:
     if _feedback_exists(user_id, request.thread_id, request.message_id):
         return False
 
-    with db_lock:
-        _db_execute(
-            """
-            INSERT INTO message_feedback
-            (user_id, thread_id, message_id, user_query, assistant_response, rating, created_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
-            """,
-            (
-                user_id,
-                request.thread_id,
-                request.message_id,
-                request.user_query,
-                request.assistant_response,
-                request.rating,
-                datetime.now(UTC).isoformat(),
-            ),
-        )
-        pg_conn.commit()
+    _db_execute(
+        """
+        INSERT INTO message_feedback
+        (user_id, thread_id, message_id, user_query, assistant_response, rating, created_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        """,
+        (
+            user_id,
+            request.thread_id,
+            request.message_id,
+            request.user_query,
+            request.assistant_response,
+            request.rating,
+            datetime.now(UTC).isoformat(),
+        ),
+    )
     return True
 
 
@@ -1091,16 +1452,14 @@ def _checkpoint_thread_id(thread_id: str, user_id: str) -> str:
 
 
 def _register_thread_if_missing(thread_id: str, user_id: str) -> None:
-    with db_lock:
-        _db_execute(
-            """
-            INSERT INTO thread_registry (user_id, thread_id, created_at, title)
-            VALUES (%s, %s, %s, NULL)
-            ON CONFLICT (user_id, thread_id) DO NOTHING
-            """,
-            (user_id, thread_id, datetime.now(UTC).isoformat()),
-        )
-        pg_conn.commit()
+    _db_execute(
+        """
+        INSERT INTO thread_registry (user_id, thread_id, created_at, title)
+        VALUES (%s, %s, %s, NULL)
+        ON CONFLICT (user_id, thread_id) DO NOTHING
+        """,
+        (user_id, thread_id, datetime.now(UTC).isoformat()),
+    )
 
 
 def _set_thread_title_if_missing(
@@ -1118,24 +1477,21 @@ def _set_thread_title_if_missing(
 
     truncated = normalized[:max_len] + ("..." if len(normalized) > max_len else "")
 
-    with db_lock:
-        _db_execute(
-            """
-            UPDATE thread_registry
-            SET title = %s
-            WHERE user_id = %s AND thread_id = %s AND (title IS NULL OR TRIM(title) = '')
-            """,
-            (truncated, user_id, thread_id),
-        )
-        pg_conn.commit()
+    _db_execute(
+        """
+        UPDATE thread_registry
+        SET title = %s
+        WHERE user_id = %s AND thread_id = %s AND (title IS NULL OR TRIM(title) = '')
+        """,
+        (truncated, user_id, thread_id),
+    )
 
 
 def _get_thread_created_at(thread_id: str, user_id: str) -> datetime:
-    with db_lock:
-        row = _db_execute(
-            "SELECT created_at FROM thread_registry WHERE user_id=%s AND thread_id=%s",
-            (user_id, thread_id),
-        ).fetchone()
+    row = _db_fetchone(
+        "SELECT created_at FROM thread_registry WHERE user_id=%s AND thread_id=%s",
+        (user_id, thread_id),
+    )
 
     if row and row[0]:
         try:
@@ -1155,15 +1511,234 @@ def _coerce_thread_created_at(thread_id: str, raw_created_at: Any) -> datetime:
     return _extract_thread_timestamp(thread_id)
 
 
-def _thread_matches_search(chatbot_instance: Any, thread_id: str, user_id: str, query: str) -> bool:
+SEARCH_TEXT_MAX_CHARS = 20000
+SEARCH_SQL_MAX_ROWS = 25
+SEARCH_SQL_MAX_CELL_CHARS = 100
+SEARCH_VIS_MAX_TRACES = 25
+SEARCH_VIS_CODE_MAX_CHARS = 2000
+
+
+def _normalize_search_text(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _truncate_text(text: str, limit: int) -> str:
+    if limit <= 0:
+        return ""
+    return text[:limit]
+
+
+def _coerce_text(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    return str(value)
+
+
+def _extend_sql_search_chunks(chunks: list[str], sql_result: dict[str, Any]) -> None:
+    columns = sql_result.get("columns")
+    if isinstance(columns, list) and columns:
+        chunks.append(" ".join(str(col) for col in columns if col is not None))
+
+    rows = sql_result.get("data")
+    if not isinstance(rows, list):
+        return
+
+    for row in rows[:SEARCH_SQL_MAX_ROWS]:
+        values: list[Any]
+        if isinstance(row, dict):
+            if isinstance(columns, list) and columns:
+                values = [row.get(col) for col in columns]
+            else:
+                values = list(row.values())
+        elif isinstance(row, (list, tuple)):
+            values = list(row)
+        else:
+            values = [row]
+
+        for value in values:
+            text = _coerce_text(value)
+            if not text:
+                continue
+            chunks.append(_truncate_text(text, SEARCH_SQL_MAX_CELL_CHARS))
+
+
+def _extend_visualization_search_chunks(chunks: list[str], figure: dict[str, Any]) -> None:
+    layout = figure.get("layout")
+    if isinstance(layout, dict):
+        title = layout.get("title")
+        if isinstance(title, dict):
+            text = _coerce_text(title.get("text"))
+            if text:
+                chunks.append(text)
+        else:
+            text = _coerce_text(title)
+            if text:
+                chunks.append(text)
+
+        for axis_key in ("xaxis", "yaxis"):
+            axis = layout.get(axis_key)
+            if isinstance(axis, dict):
+                axis_title = axis.get("title")
+                if isinstance(axis_title, dict):
+                    text = _coerce_text(axis_title.get("text"))
+                else:
+                    text = _coerce_text(axis_title)
+                if text:
+                    chunks.append(text)
+
+    traces = figure.get("data")
+    if isinstance(traces, list):
+        for trace in traces[:SEARCH_VIS_MAX_TRACES]:
+            if not isinstance(trace, dict):
+                continue
+            name = _coerce_text(trace.get("name"))
+            if name:
+                chunks.append(name)
+
+
+def _build_search_text_from_cached(messages: list[dict[str, Any]]) -> str:
+    chunks: list[str] = []
+
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+
+        parts = message.get("parts")
+        if not isinstance(parts, list):
+            continue
+
+        for part in parts:
+            if not isinstance(part, dict):
+                continue
+
+            part_type = part.get("type")
+            if part_type == "data-relevantQuestions":
+                continue
+
+            if part_type == "text":
+                text = _coerce_text(part.get("text"))
+                if text:
+                    chunks.append(text)
+                continue
+
+            if part_type == "data-resultSummary":
+                text = _coerce_text(part.get("data"))
+                if text:
+                    chunks.append(text)
+                continue
+
+            if part_type == "data-sqlQuery":
+                text = _coerce_text(part.get("data"))
+                if text:
+                    chunks.append(text)
+                continue
+
+            if part_type == "data-sqlColumns":
+                data = part.get("data")
+                if isinstance(data, list) and data:
+                    chunks.append(" ".join(str(col) for col in data if col is not None))
+                else:
+                    text = _coerce_text(data)
+                    if text:
+                        chunks.append(text)
+                continue
+
+            if part_type == "data-sqlResult":
+                data = part.get("data")
+                if isinstance(data, dict):
+                    _extend_sql_search_chunks(chunks, data)
+                continue
+
+            if part_type == "data-visualizationFigure":
+                data = part.get("data")
+                if isinstance(data, dict):
+                    _extend_visualization_search_chunks(chunks, data)
+                continue
+
+            if part_type == "data-visualizationCode":
+                text = _coerce_text(part.get("data"))
+                if text:
+                    chunks.append(_truncate_text(text, SEARCH_VIS_CODE_MAX_CHARS))
+                continue
+
+    if not chunks:
+        return ""
+
+    normalized = _normalize_search_text(" ".join(chunks))
+    return _truncate_text(normalized, SEARCH_TEXT_MAX_CHARS)
+
+
+def _build_search_text_from_cached_payload(payload: Any) -> str:
+    if isinstance(payload, list):
+        return _build_search_text_from_cached(payload)
+
+    if isinstance(payload, str):
+        try:
+            parsed = json.loads(payload)
+        except Exception:
+            return ""
+
+        if isinstance(parsed, list):
+            return _build_search_text_from_cached(parsed)
+
+    return ""
+
+
+def _load_cached_messages_with_presence(
+    thread_id: str, user_id: str
+) -> tuple[list[dict[str, Any]], bool]:
+    row = _db_fetchone(
+        "SELECT messages_json FROM thread_message_cache WHERE user_id=%s AND thread_id=%s",
+        (user_id, thread_id),
+    )
+
+    if not row:
+        return [], False
+
+    if not row[0]:
+        return [], True
+
+    try:
+        parsed = json.loads(row[0])
+        if isinstance(parsed, list):
+            return parsed, True
+    except Exception:
+        return [], True
+
+    return [], True
+
+
+def _thread_matches_search(
+    chatbot_instance: Any,
+    thread_id: str,
+    user_id: str,
+    query: str,
+    thread_title: Optional[str] = None,
+) -> bool:
     if not query:
         return True
 
-    state = chatbot_instance.get_state(
-        config={"configurable": {"thread_id": _checkpoint_thread_id(thread_id, user_id)}}
-    )
-    messages = state.values.get("messages", [])
     lowered = query.lower()
+    if thread_title and lowered in thread_title.lower():
+        return True
+
+    cached_messages, has_cache = _load_cached_messages_with_presence(thread_id, user_id)
+    if has_cache:
+        cached_text = _build_search_text_from_cached(cached_messages)
+        if cached_text and lowered in cached_text.lower():
+            return True
+        # Cache is a fast path. If cache misses (or is empty), fall back to
+        # checkpoint state to avoid false negatives from stale/incomplete cache.
+
+    try:
+        state = chatbot_instance.get_state(
+            config={"configurable": {"thread_id": _checkpoint_thread_id(thread_id, user_id)}}
+        )
+        messages = state.values.get("messages", [])
+    except Exception:
+        return False
 
     for msg in messages:
         content = getattr(msg, "content", "")
@@ -1179,11 +1754,10 @@ def _get_thread_title(
     user_id: str,
     max_len: int = 80,
 ) -> str:
-    with db_lock:
-        cached_row = _db_execute(
-            "SELECT title FROM thread_registry WHERE user_id=%s AND thread_id=%s",
-            (user_id, thread_id),
-        ).fetchone()
+    cached_row = _db_fetchone(
+        "SELECT title FROM thread_registry WHERE user_id=%s AND thread_id=%s",
+        (user_id, thread_id),
+    )
     if cached_row and isinstance(cached_row[0], str) and cached_row[0].strip():
         return cached_row[0].strip()
 
@@ -1236,31 +1810,29 @@ def _get_thread_title(
 
 
 def _list_visible_threads(chatbot_instance: Any, user_id: str) -> list[str]:
-    with db_lock:
-        registry_rows = _db_execute(
-            """
-            SELECT thread_id
-            FROM thread_registry
-            WHERE user_id=%s AND COALESCE(is_hidden, FALSE)=FALSE
-            """,
-            (user_id,),
-        ).fetchall()
+    registry_rows = _db_fetchall(
+        """
+        SELECT thread_id
+        FROM thread_registry
+        WHERE user_id=%s AND COALESCE(is_hidden, FALSE)=FALSE
+        """,
+        (user_id,),
+    )
 
     return [str(row[0]) for row in registry_rows if row and row[0]]
 
 
 def _is_thread_visible(chatbot_instance: Any, thread_id: str, user_id: str) -> bool:
-    with db_lock:
-        registry_row = _db_execute(
-            """
-            SELECT 1
-            FROM thread_registry
-            WHERE user_id=%s
-              AND thread_id=%s
-              AND COALESCE(is_hidden, FALSE)=FALSE
-            """,
-            (user_id, thread_id),
-        ).fetchone()
+    registry_row = _db_fetchone(
+        """
+        SELECT 1
+        FROM thread_registry
+        WHERE user_id=%s
+          AND thread_id=%s
+          AND COALESCE(is_hidden, FALSE)=FALSE
+        """,
+        (user_id, thread_id),
+    )
     return registry_row is not None
 
 
@@ -1289,11 +1861,10 @@ def _extract_text_from_content(content: Any) -> str:
 
 
 def _load_cached_messages(thread_id: str, user_id: str) -> list[dict[str, Any]]:
-    with db_lock:
-        row = _db_execute(
-            "SELECT messages_json FROM thread_message_cache WHERE user_id=%s AND thread_id=%s",
-            (user_id, thread_id),
-        ).fetchone()
+    row = _db_fetchone(
+        "SELECT messages_json FROM thread_message_cache WHERE user_id=%s AND thread_id=%s",
+        (user_id, thread_id),
+    )
     if not row or not row[0]:
         return []
 
@@ -1309,17 +1880,15 @@ def _load_cached_messages(thread_id: str, user_id: str) -> list[dict[str, Any]]:
 
 def _save_cached_messages(thread_id: str, user_id: str, messages: list[dict[str, Any]]) -> None:
     payload = json.dumps(messages, ensure_ascii=True, default=str)
-    with db_lock:
-        _db_execute(
-            """
-            INSERT INTO thread_message_cache (user_id, thread_id, messages_json, updated_at)
-            VALUES (%s, %s, %s, %s)
-            ON CONFLICT(user_id, thread_id)
-            DO UPDATE SET messages_json=EXCLUDED.messages_json, updated_at=EXCLUDED.updated_at
-            """,
-            (user_id, thread_id, payload, datetime.now(UTC).isoformat()),
-        )
-        pg_conn.commit()
+    _db_execute(
+        """
+        INSERT INTO thread_message_cache (user_id, thread_id, messages_json, updated_at)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT(user_id, thread_id)
+        DO UPDATE SET messages_json=EXCLUDED.messages_json, updated_at=EXCLUDED.updated_at
+        """,
+        (user_id, thread_id, payload, datetime.now(UTC).isoformat()),
+    )
 
 
 def _serialize_thread_messages(
@@ -1471,8 +2040,16 @@ def _serialize_thread_messages_with_timeout(
 
 
 @app.get("/health")
-def health() -> dict[str, str]:
-    return {"status": "ok"}
+def health() -> dict[str, Any]:
+    return {
+        "status": "ok",
+        "db": {
+            "ready": db_ready,
+            "retryAttempts": db_retry_attempts,
+            "lastError": db_last_error,
+            "lastSuccessAt": db_last_success_at,
+        },
+    }
 
 
 @app.get("/api/v1/daily-pulse/questions")
@@ -1480,55 +2057,55 @@ def get_daily_pulse_questions(raw_request: Request) -> dict[str, Any]:
     current_user = _get_request_user(raw_request)
     current_user_id = current_user["user_id"]
 
-    questions: list[str] = []
-    try:
-        with db_lock:
-            rows = _db_execute(
-                """
-                SELECT question
-                FROM daily_pulse_questions
-                WHERE user_id=%s
-                ORDER BY order_index ASC, created_at ASC
-                """,
-                (current_user_id,),
-            ).fetchall()
-            questions = [str(row[0]).strip() for row in rows if row and str(row[0]).strip()]
+    for attempt in (1, 2):
+        questions: list[str] = []
+        try:
+            pool = _ensure_db_pool()
+            with pool.connection() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT question
+                    FROM daily_pulse_questions
+                    WHERE user_id=%s
+                    ORDER BY order_index ASC, created_at ASC
+                    """,
+                    (current_user_id,),
+                ).fetchall()
+                questions = [str(row[0]).strip() for row in rows if row and str(row[0]).strip()]
 
-            if not questions:
-                now_iso = datetime.now(UTC).isoformat()
-                for index, question in enumerate(DEFAULT_DAILY_PULSE_QUESTIONS):
-                    _db_execute(
-                        """
-                        INSERT INTO daily_pulse_questions (
-                            user_id,
-                            question,
-                            order_index,
-                            created_at,
-                            updated_at
+                if not questions:
+                    now_iso = datetime.now(UTC).isoformat()
+                    for index, question in enumerate(DEFAULT_DAILY_PULSE_QUESTIONS):
+                        conn.execute(
+                            """
+                            INSERT INTO daily_pulse_questions (
+                                user_id,
+                                question,
+                                order_index,
+                                created_at,
+                                updated_at
+                            )
+                            VALUES (%s, %s, %s, %s, %s)
+                            """,
+                            (current_user_id, question, index, now_iso, now_iso),
                         )
-                        VALUES (%s, %s, %s, %s, %s)
-                        """,
-                        (current_user_id, question, index, now_iso, now_iso),
-                    )
-                _db_commit()
-                questions = list(DEFAULT_DAILY_PULSE_QUESTIONS)
-    except HTTPException:
-        raise
-    except psycopg.errors.UndefinedTable:
-        with db_lock:
-            if pg_conn is not None:
-                pg_conn.rollback()
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                "daily_pulse_questions table is missing. "
-                "Run the manual SQL migration before using this endpoint."
-            ),
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Failed to read daily pulse questions: {exc}")
+                    questions = list(DEFAULT_DAILY_PULSE_QUESTIONS)
+                return {"questions": questions, "count": len(questions)}
+        except psycopg.errors.UndefinedTable as exc:
+            if attempt == 1 and _ensure_table_if_needed("daily_pulse_questions"):
+                _log_db_event("db.query_retry_after_ensure", table="daily_pulse_questions")
+                continue
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "daily_pulse_questions table is missing and auto-create failed. "
+                    f"Error: {exc}"
+                ),
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Failed to read daily pulse questions: {exc}")
 
-    return {"questions": questions, "count": len(questions)}
+    raise HTTPException(status_code=500, detail="Failed to read daily pulse questions")
 
 
 @app.put("/api/v1/daily-pulse/questions")
@@ -1549,46 +2126,42 @@ def update_daily_pulse_questions(
     if not deduped:
         raise HTTPException(status_code=400, detail="At least one question is required")
 
-    try:
-        now_iso = datetime.now(UTC).isoformat()
-        with db_lock:
-            _db_execute(
-                "DELETE FROM daily_pulse_questions WHERE user_id=%s",
-                (current_user_id,),
-            )
-            for index, question in enumerate(deduped):
-                _db_execute(
-                    """
-                    INSERT INTO daily_pulse_questions (
-                        user_id,
-                        question,
-                        order_index,
-                        created_at,
-                        updated_at
+    for attempt in (1, 2):
+        try:
+            now_iso = datetime.now(UTC).isoformat()
+            pool = _ensure_db_pool()
+            with pool.connection() as conn:
+                conn.execute("DELETE FROM daily_pulse_questions WHERE user_id=%s", (current_user_id,))
+                for index, question in enumerate(deduped):
+                    conn.execute(
+                        """
+                        INSERT INTO daily_pulse_questions (
+                            user_id,
+                            question,
+                            order_index,
+                            created_at,
+                            updated_at
+                        )
+                        VALUES (%s, %s, %s, %s, %s)
+                        """,
+                        (current_user_id, question, index, now_iso, now_iso),
                     )
-                    VALUES (%s, %s, %s, %s, %s)
-                    """,
-                    (current_user_id, question, index, now_iso, now_iso),
-                )
-            _db_commit()
-    except psycopg.errors.UndefinedTable:
-        with db_lock:
-            if pg_conn is not None:
-                pg_conn.rollback()
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                "daily_pulse_questions table is missing. "
-                "Run the manual SQL migration before using this endpoint."
-            ),
-        )
-    except Exception as exc:
-        with db_lock:
-            if pg_conn is not None:
-                pg_conn.rollback()
-        raise HTTPException(status_code=500, detail=f"Failed to update daily pulse questions: {exc}")
+            return {"questions": deduped, "count": len(deduped)}
+        except psycopg.errors.UndefinedTable as exc:
+            if attempt == 1 and _ensure_table_if_needed("daily_pulse_questions"):
+                _log_db_event("db.query_retry_after_ensure", table="daily_pulse_questions")
+                continue
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "daily_pulse_questions table is missing and auto-create failed. "
+                    f"Error: {exc}"
+                ),
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Failed to update daily pulse questions: {exc}")
 
-    return {"questions": deduped, "count": len(deduped)}
+    raise HTTPException(status_code=500, detail="Failed to update daily pulse questions")
 
 
 def _run_chat_request(request: ChatRequest, user_id: str) -> ChatResponse:
@@ -1693,7 +2266,7 @@ def chat(request: ChatRequest, raw_request: Request) -> ChatResponse:
 
 
 def _sse_event(event_name: str, payload: dict[str, Any]) -> str:
-    return f"event: {event_name}\ndata: {json.dumps(payload, ensure_ascii=True)}\n\n"
+    return f"event: {event_name}\ndata: {json.dumps(payload, ensure_ascii=True, default=str)}\n\n"
 
 
 @app.post("/api/v1/chat/stream")
@@ -2134,17 +2707,16 @@ def get_history(
 
     # Hot path optimization: first page without search should stay SQL-limited.
     if not ending_before and not normalized_q:
-        with db_lock:
-            rows = _db_execute(
-                """
-                                SELECT r.thread_id, r.created_at, r.title
-                FROM thread_registry r
-                                WHERE r.user_id=%s AND COALESCE(r.is_hidden, FALSE)=FALSE
-                ORDER BY r.created_at DESC
-                LIMIT %s
-                """,
-                (current_user_id, normalized_limit + 1),
-            ).fetchall()
+        rows = _db_fetchall(
+            """
+                            SELECT r.thread_id, r.created_at, r.title
+            FROM thread_registry r
+                            WHERE r.user_id=%s AND COALESCE(r.is_hidden, FALSE)=FALSE
+            ORDER BY r.created_at DESC
+            LIMIT %s
+            """,
+            (current_user_id, normalized_limit + 1),
+        )
 
         page_rows = rows[:normalized_limit]
         has_more = len(rows) > normalized_limit
@@ -2168,11 +2740,10 @@ def get_history(
     # Keep list endpoint DB-first; avoid expensive checkpoint hydration for titles.
     thread_ids = _list_visible_threads(None, current_user_id)
     thread_meta: dict[str, dict[str, Any]] = {}
-    with db_lock:
-        registry_rows = _db_execute(
-            "SELECT thread_id, created_at, title FROM thread_registry WHERE user_id=%s",
-            (current_user_id,),
-        ).fetchall()
+    registry_rows = _db_fetchall(
+        "SELECT thread_id, created_at, title FROM thread_registry WHERE user_id=%s",
+        (current_user_id,),
+    )
     for row in registry_rows:
         if not row or not row[0]:
             continue
@@ -2181,21 +2752,63 @@ def get_history(
             "title": row[2],
         }
 
+    title_match_ids: set[str] = set()
+    cache_match_ids: set[str] = set()
     if normalized_q and len(normalized_q) >= 2:
-        chatbot_instance = _get_chatbot()
-        thread_ids = [
-            thread_id
-            for thread_id in thread_ids
-            if _thread_matches_search(chatbot_instance, thread_id, current_user_id, normalized_q)
-        ]
+        like_pattern = f"%{normalized_q}%"
 
-    sorted_threads = sorted(
-        thread_ids,
-        key=lambda thread_id: (
-            _coerce_thread_created_at(thread_id, thread_meta.get(thread_id, {}).get("created_at"))
-        ),
-        reverse=True,
-    )
+        title_match_rows = _db_fetchall(
+            """
+            SELECT thread_id
+            FROM thread_registry
+            WHERE user_id=%s
+              AND COALESCE(is_hidden, FALSE)=FALSE
+              AND COALESCE(title, '') ILIKE %s
+            """,
+            (current_user_id, like_pattern),
+        )
+        cache_match_rows = _db_fetchall(
+            """
+            SELECT thread_id
+            FROM thread_message_cache
+            WHERE user_id=%s
+              AND messages_json ILIKE %s
+            """,
+            (current_user_id, like_pattern),
+        )
+
+        title_match_ids = {str(row[0]) for row in title_match_rows if row and row[0]}
+        cache_match_ids = {str(row[0]) for row in cache_match_rows if row and row[0]}
+
+        matched_thread_ids = title_match_ids | cache_match_ids
+        thread_ids = [thread_id for thread_id in thread_ids if thread_id in matched_thread_ids]
+
+    if normalized_q and len(normalized_q) >= 2:
+        lowered_q = normalized_q.lower()
+
+        def _relevance_score(thread_id: str) -> tuple[int, int]:
+            title_text = str(thread_meta.get(thread_id, {}).get("title") or "").strip().lower()
+            starts_with = 1 if title_text.startswith(lowered_q) else 0
+            in_title = 1 if thread_id in title_match_ids else 0
+            in_cache = 1 if thread_id in cache_match_ids else 0
+            return (starts_with, (in_title * 2) + in_cache)
+
+        sorted_threads = sorted(
+            thread_ids,
+            key=lambda thread_id: (
+                _relevance_score(thread_id),
+                _coerce_thread_created_at(thread_id, thread_meta.get(thread_id, {}).get("created_at")),
+            ),
+            reverse=True,
+        )
+    else:
+        sorted_threads = sorted(
+            thread_ids,
+            key=lambda thread_id: (
+                _coerce_thread_created_at(thread_id, thread_meta.get(thread_id, {}).get("created_at"))
+            ),
+            reverse=True,
+        )
 
     start_index = 0
     if ending_before:
@@ -2286,16 +2899,14 @@ def delete_all_history(raw_request: Request) -> dict[str, bool]:
     current_user = _get_request_user(raw_request)
     current_user_id = current_user["user_id"]
 
-    with db_lock:
-        _db_execute(
-            """
-            UPDATE thread_registry
-            SET is_hidden=TRUE, hidden_at=%s
-            WHERE user_id=%s AND COALESCE(is_hidden, FALSE)=FALSE
-            """,
-            (datetime.now(UTC).isoformat(), current_user_id),
-        )
-        pg_conn.commit()
+    _db_execute(
+        """
+        UPDATE thread_registry
+        SET is_hidden=TRUE, hidden_at=%s
+        WHERE user_id=%s AND COALESCE(is_hidden, FALSE)=FALSE
+        """,
+        (datetime.now(UTC).isoformat(), current_user_id),
+    )
     return {"success": True}
 
 
@@ -2306,20 +2917,18 @@ def delete_history(thread_id: str, raw_request: Request) -> dict[str, bool]:
     if not _is_thread_visible(None, thread_id, current_user_id):
         raise HTTPException(status_code=404, detail="Thread not found")
 
-    with db_lock:
-        _db_execute(
-            """
-            UPDATE thread_registry
-            SET is_hidden=TRUE, hidden_at=%s
-            WHERE user_id=%s AND thread_id=%s
-            """,
-            (datetime.now(UTC).isoformat(), current_user_id, thread_id),
-        )
-        _db_execute(
-            "DELETE FROM message_feedback WHERE user_id=%s AND thread_id=%s",
-            (current_user_id, thread_id),
-        )
-        pg_conn.commit()
+    _db_execute(
+        """
+        UPDATE thread_registry
+        SET is_hidden=TRUE, hidden_at=%s
+        WHERE user_id=%s AND thread_id=%s
+        """,
+        (datetime.now(UTC).isoformat(), current_user_id, thread_id),
+    )
+    _db_execute(
+        "DELETE FROM message_feedback WHERE user_id=%s AND thread_id=%s",
+        (current_user_id, thread_id),
+    )
     return {"success": True}
 
 
@@ -2330,16 +2939,15 @@ def get_votes(thread_id: str, raw_request: Request) -> list[dict[str, Any]]:
     if not _is_thread_visible(None, thread_id, current_user_id):
         raise HTTPException(status_code=404, detail="Thread not found")
 
-    with db_lock:
-        rows = _db_execute(
-            """
-            SELECT thread_id, message_id, rating
-            FROM message_feedback
-            WHERE user_id=%s AND thread_id=%s
-            ORDER BY id DESC
-            """,
-            (current_user_id, thread_id),
-        ).fetchall()
+    rows = _db_fetchall(
+        """
+        SELECT thread_id, message_id, rating
+        FROM message_feedback
+        WHERE user_id=%s AND thread_id=%s
+        ORDER BY id DESC
+        """,
+        (current_user_id, thread_id),
+    )
 
     latest_by_message: dict[str, dict[str, Any]] = {}
     for current_thread, message_id, rating in rows:

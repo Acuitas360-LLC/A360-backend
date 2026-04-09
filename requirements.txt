@@ -5,6 +5,7 @@ openai
 matplotlib
 langgraph-checkpoint-postgres
 psycopg[binary]
+psycopg-pool
 snowflake-connector-python
 mysql-connector-python
 faiss-cpu
