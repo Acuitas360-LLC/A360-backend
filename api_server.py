@@ -2349,10 +2349,6 @@ async def chat_stream(request: ChatRequest, raw_request: Request) -> StreamingRe
                 "status",
                 {"key": "analyzing", "label": "Analyzing", "state": "active"},
             )
-            yield _sse_event(
-                "status",
-                {"key": "generating_sql", "label": "Generating SQL", "state": "active"},
-            )
 
             if await _client_disconnected():
                 return
@@ -2363,6 +2359,15 @@ async def chat_stream(request: ChatRequest, raw_request: Request) -> StreamingRe
             seed_message = HumanMessage(content=request.question)
             sql_generator_rag_examples_text, query_decomposer_rag_examples_text, relevant_questions = (
                 await asyncio.to_thread(_build_rag_examples_for_question, request.question)
+            )
+
+            yield _sse_event(
+                "status",
+                {"key": "analyzing", "label": "Analyzing", "state": "completed"},
+            )
+            yield _sse_event(
+                "status",
+                {"key": "analyzing_data", "label": "Analyzing data", "state": "active"},
             )
 
             stream_graph = _get_stream_subgraph()

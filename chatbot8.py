@@ -273,8 +273,6 @@ def search_snowflake(user_query, intent, top_k=7):
             "query_decomposition": row["QUERY_DECOMPOSITION"],
             "final_sql": row["FINAL_SQL"],
         })
-    
-    print("potential followup questions check: (7) ", len(results))
 
     return results
 

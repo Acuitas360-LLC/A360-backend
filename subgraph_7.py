@@ -171,6 +171,95 @@ def parse_review_output(text: str, source: str) -> ReviewDecision:
 def get_recent_messages(messages: list, n: int = 10):
     return messages[-n:] if len(messages) > n else messages
 
+# def get_clean_recent_turns(messages: List, n_turns: int = 3):
+#     """
+#     Returns last n conversation turns in compact form.
+
+#     Keeps:
+#     - HumanMessage (full)
+#     - AIMessage with only:
+#         * SQL Query Executed
+#         * Result Summary
+
+#     Removes:
+#     - Query Results
+#     - Visualization code
+#     - Relevant Questions
+#     """
+
+#     turns = []
+#     current_turn = []
+
+#     # -------- Step 1: Build turns (reverse traversal) --------
+#     for msg in reversed(messages):
+#         current_turn.insert(0, msg)
+
+#         if isinstance(msg, HumanMessage):
+#             turns.insert(0, current_turn)
+#             current_turn = []
+
+#             if len(turns) == n_turns:
+#                 break
+
+#     # -------- Step 2: Clean AI messages --------
+#     cleaned_messages = []
+
+#     for turn in turns:
+#         for msg in turn:
+
+#             # Keep human messages fully
+#             if isinstance(msg, HumanMessage):
+#                 cleaned_messages.append(msg)
+
+#             elif isinstance(msg, AIMessage):
+#                 content = msg.content or ""
+
+#                 sql_part = ""
+#                 summary_part = ""
+
+#                 # Extract SQL
+#                 if "SQL Query Executed:" in content:
+#                     sql_part = content.split("SQL Query Executed:")[-1]
+
+#                     # Stop at next section
+#                     for stop in ["Result Summary:", "Relevant Questions:", "Query Results:", "Visualization Code:"]:
+#                         if stop in sql_part:
+#                             sql_part = sql_part.split(stop)[0]
+#                             break
+
+#                     sql_part = sql_part.strip()
+
+#                 # Extract Summary
+#                 if "Result Summary:" in content:
+#                     summary_part = content.split("Result Summary:")[-1]
+
+#                     for stop in ["Relevant Questions:", "Query Results:", "Visualization Code:"]:
+#                         if stop in summary_part:
+#                             summary_part = summary_part.split(stop)[0]
+#                             break
+
+#                     summary_part = summary_part.strip()
+
+#                 # Build cleaned AI message if something exists
+#                 cleaned_content = ""
+
+#                 if sql_part:
+#                     cleaned_content += "SQL Query Executed:\n" + sql_part + "\n\n"
+
+#                 if summary_part:
+#                     cleaned_content += "Result Summary:\n" + summary_part
+
+#                 if cleaned_content:
+#                     cleaned_messages.append(
+#                         AIMessage(content=cleaned_content.strip())
+#                     )
+
+#     return cleaned_messages
+
+from typing import List
+from langchain_core.messages import HumanMessage, AIMessage
+
+
 def get_clean_recent_turns(messages: List, n_turns: int = 3):
     """
     Returns last n conversation turns in compact form.
@@ -180,9 +269,9 @@ def get_clean_recent_turns(messages: List, n_turns: int = 3):
     - AIMessage with only:
         * SQL Query Executed
         * Result Summary
+    - SQL Results (structured, from additional_kwargs)
 
     Removes:
-    - Query Results
     - Visualization code
     - Relevant Questions
     """
@@ -201,46 +290,82 @@ def get_clean_recent_turns(messages: List, n_turns: int = 3):
             if len(turns) == n_turns:
                 break
 
-    # -------- Step 2: Clean AI messages --------
+    # -------- Step 2: Clean messages --------
     cleaned_messages = []
 
     for turn in turns:
         for msg in turn:
 
-            # Keep human messages fully
+            # ✅ 1. Keep Human messages fully
             if isinstance(msg, HumanMessage):
                 cleaned_messages.append(msg)
+                continue
 
             elif isinstance(msg, AIMessage):
+
+                # 🔥 Safe extraction of additional_kwargs
+                kwargs = getattr(msg, "additional_kwargs", {}) or {}
+                print("kwargs: ",kwargs)
+                msg_type = kwargs.get("type")
+                print("msg_type: ",msg_type)
+
+                # ✅ 2. Preserve SQL Results (PRIMARY: kwargs, FALLBACK: content)
+                if (
+                    msg_type == "sql_result"
+                    or (msg.content and msg.content.lower().strip() == "sql query results")
+                ):
+                    cleaned_messages.append(
+                        AIMessage(
+                            content="SQL Query Results",
+                            additional_kwargs={
+                                "type": "sql_result",
+                                "data": kwargs.get("data")
+                            }
+                        )
+                    )
+                    continue
+
+                # 🚫 Skip visualization messages
+                if msg_type == "visualization":
+                    continue
+
                 content = msg.content or ""
 
                 sql_part = ""
                 summary_part = ""
 
-                # Extract SQL
+                # -------- Extract SQL --------
                 if "SQL Query Executed:" in content:
                     sql_part = content.split("SQL Query Executed:")[-1]
 
-                    # Stop at next section
-                    for stop in ["Result Summary:", "Relevant Questions:", "Query Results:", "Visualization Code:"]:
+                    for stop in [
+                        "Result Summary:",
+                        "Relevant Questions:",
+                        "Query Results:",
+                        "Visualization Code:"
+                    ]:
                         if stop in sql_part:
                             sql_part = sql_part.split(stop)[0]
                             break
 
                     sql_part = sql_part.strip()
 
-                # Extract Summary
+                # -------- Extract Summary --------
                 if "Result Summary:" in content:
                     summary_part = content.split("Result Summary:")[-1]
 
-                    for stop in ["Relevant Questions:", "Query Results:", "Visualization Code:"]:
+                    for stop in [
+                        "Relevant Questions:",
+                        "Query Results:",
+                        "Visualization Code:"
+                    ]:
                         if stop in summary_part:
                             summary_part = summary_part.split(stop)[0]
                             break
 
                     summary_part = summary_part.strip()
 
-                # Build cleaned AI message if something exists
+                # -------- Build cleaned AI message --------
                 cleaned_content = ""
 
                 if sql_part:
@@ -249,14 +374,12 @@ def get_clean_recent_turns(messages: List, n_turns: int = 3):
                 if summary_part:
                     cleaned_content += "Result Summary:\n" + summary_part
 
-                if cleaned_content:
+                if cleaned_content.strip():
                     cleaned_messages.append(
                         AIMessage(content=cleaned_content.strip())
                     )
 
     return cleaned_messages
-
-
 
 class AgentState(TypedDict):
     # inputs
@@ -292,9 +415,51 @@ def build_messages(state,SYSTEM_PROMPT):
     print("Recent Messages")
     print(recent_messages)
     print("-"*100)
+    recent_context_prompt=f"""
+────────────────────────
+RECENT CONVERSATION CONTEXT (CRITICAL)
+────────────────────────
+The following messages represent the MOST RECENT conversation history.
 
+They contain previously computed:
+
+* Entities (e.g., accounts, regions, products, tiers, segments)
+* Filters (e.g., date ranges, time periods, conditions)
+* Metrics (e.g., sales, growth, aggregates)
+* SQL queries and their results
+
+You MUST treat this as ACTIVE CONTEXT.
+
+Rules:
+
+1. Anchor to Recent Context:
+
+   * Always use this context to interpret the current request.
+   * Prefer the MOST RECENT relevant information.
+
+2. Reference Resolution:
+
+   * Terms like "those", "them", "same", "above", "previous", "that"
+     MUST be resolved using this context.
+
+3. Do NOT Recompute:
+
+   * If entities, filters, or results already exist, reuse them.
+   * Do NOT generate new values if they can be derived from context.
+
+4. Maintain Continuity:
+
+   * Preserve the same entities, filters, and grouping unless explicitly changed.
+   * Apply only incremental changes requested by the user.
+
+5. Trust Data Over Assumptions:
+
+   * Prefer SQL results and explicit values over inferred logic.
+
+"""
     return [
         SystemMessage(content=SYSTEM_PROMPT),
+        SystemMessage(content=recent_context_prompt),
         *recent_messages
     ]
 
@@ -387,6 +552,7 @@ def query_decomposer_node(state: AgentState):
     Our Product is Relmora and Competitor product is zynava.
     For our product vs competitor growth comparisons, use `data_867.relmora_total_mg` and `data_ddd.zynava_total_mg`. Compare recent 3 months vs previous 3 months, anchored to the latest `month_year` from `data_ddd`, and apply the same months to `data_867`.
     For every time period in the output, explicitly display the corresponding number of business days
+    Always perform aggregations using ID fields (e.g., campus_id, parent_id, region_id, territory_id) for accuracy, and include the corresponding names in the final output.
     Always determine the latest time period using week_end_date or date, not MAX(quarter_year) or MAX(month_year), because quarter_year and month_year are strings and may not sort chronologically. Retrieve the corresponding quarter_year or month_year from the row with the latest week_end_date or date.
     Whenever a user asks about performance, always calculate and include the growth (percentage change vs the previous comparable period)
     Whenever growth is calculated for any segmentation level (e.g., segment, tier, region, area, geography, account type, city, state, or territory), also calculate nation growth and add a column indicating whether the segment is performing Higher or Lower than the nation.
@@ -504,7 +670,7 @@ For month/quarter queries, anchor to `month_year` and `quarter_year` respectivel
 
 For data_867: Do not automatically restrict calculations to the **most recent completed period** unless the user explicitly requests it.
 
-data_DDD Rules (Competitor & Market Share Analysis) (VERY IMPORTANT):
+data_DDD Rules (Competitor & Market Share Analysis or share in general) (VERY IMPORTANT):
 
 - Use relmora_total_sls and zynava_total_sls for all calculations.
 - date is the month-end field and the primary time anchor.
@@ -515,7 +681,7 @@ data_DDD Rules (Competitor & Market Share Analysis) (VERY IMPORTANT):
 Time Handling:
 - Always derive time ranges using date.
 - Use month_year or quarter_year only when explicitly requested, but still derive boundaries from date.
-- If no timeframe is specified → use last 6 months.
+- If no timeframe is specified → use last 3 months.
 - For “current/recent/last” → determine using MAX(date).
 
 Growth & Comparison:
@@ -700,6 +866,42 @@ IMPORTANT:
 - If the latest message requests a modification, apply ONLY the requested changes.
 - If the latest message restates the request, treat it as a full replacement.
 
+
+────────────────────────
+CONTEXT CONTINUITY (CRITICAL)
+────────────────────────
+Recent messages contain previously computed:
+
+Entities (e.g., accounts, regions, products, tiers, segments)
+Filters (e.g., date ranges, time periods, conditions)
+Metrics (e.g., sales, growth, aggregates)
+Grouping and aggregation logic
+
+You MUST treat them as ACTIVE CONTEXT.
+
+Rules:
+
+Reference Resolution:
+If the user refers to:
+"those", "them", "same", "above", "previous", "that"
+→ Resolve using the MOST RECENT relevant context.
+Entity & Filter Reuse:
+NEVER regenerate entities or filters if they already exist.
+ALWAYS reuse exact values from prior results when available.
+Continuity Enforcement:
+Maintain SAME entities
+Maintain SAME filters (unless explicitly changed)
+Maintain SAME grouping level and granularity
+Incremental Changes Only:
+If the user asks for a modification (e.g., growth, comparison, breakdown),
+apply ONLY that change on top of existing context.
+Do NOT recompute from scratch unless explicitly asked.
+Source of Truth Priority:
+Resolve context using:
+(1) SQL Query Results (highest priority)
+(2) Explicit values mentioned in prior messages
+(3) SQL Query logic
+
 ────────────────────────
 INPUT
 ────────────────────────
@@ -750,6 +952,7 @@ USER QUERY (LATEST HUMAN MESSAGE)
     Our Product is Relmora and Competitor product is zynava.
     For our product vs competitor growth comparisons, use `data_867.relmora_total_mg` and `data_ddd.zynava_total_mg`. Compare recent 3 months vs previous 3 months, anchored to the latest `month_year` from `data_ddd`, and apply the same months to `data_867`.
     For every time period in the output, explicitly display the corresponding number of business days
+    Always perform aggregations using ID fields (e.g., campus_id, parent_id, region_id, territory_id) for accuracy, and include the corresponding names in the final output.
     Whenever growth is calculated for any segmentation level (e.g., segment, tier, region, area, geography, account type, city, state, or territory), also calculate nation growth and add a column indicating whether the segment is performing Higher or Lower than the nation.
     All segment vs nation growth comparisons must be strictly based on Daily Average Growth (growth normalized by national business days), which serves as the single anchor metric for determining relative performance.
     If asked about sales by default give national sales don't group by campus_id or campus_account name.
@@ -865,7 +1068,7 @@ For month/quarter queries, anchor to `month_year` and `quarter_year` respectivel
 
 For data_867: Do not automatically restrict calculations to the **most recent completed period** unless the user explicitly requests it.
 
-data_DDD Rules (Competitor & Market Share Analysis) (VERY IMPORTANT):
+data_DDD Rules (Competitor & Market Share Analysis or share in general) (VERY IMPORTANT):
 
 - Use relmora_total_sls and zynava_total_sls for all calculations.
 - date is the month-end field and the primary time anchor.
@@ -876,7 +1079,7 @@ data_DDD Rules (Competitor & Market Share Analysis) (VERY IMPORTANT):
 Time Handling:
 - Always derive time ranges using date.
 - Use month_year or quarter_year only when explicitly requested, but still derive boundaries from date.
-- If no timeframe is specified → use last 6 months.
+- If no timeframe is specified → use last 3 months.
 - For “current/recent/last” → determine using MAX(date).
 
 Growth & Comparison:
@@ -1194,6 +1397,7 @@ For data_867: The table contains week_end_date, month_year, and quarter_year. Us
     Our Product is Relmora and Competitor product is zynava.
     For our product vs competitor growth comparisons, use `data_867.relmora_total_mg` and `data_ddd.zynava_total_mg`. Compare recent 3 months vs previous 3 months, anchored to the latest `month_year` from `data_ddd`, and apply the same months to `data_867`.
     For every time period in the output, explicitly display the corresponding number of business days
+    Always perform aggregations using ID fields (e.g., campus_id, parent_id, region_id, territory_id) for accuracy, and include the corresponding names in the final output.
     Whenever growth is calculated for any segmentation level (e.g., segment, tier, region, area, geography, account type, city, state, or territory), also calculate nation growth and add a column indicating whether the segment is performing Higher or Lower than the nation.
     All segment vs nation growth comparisons must be strictly based on Daily Average Growth (growth normalized by national business days), which serves as the single anchor metric for determining relative performance.
     If asked about sales by default give national sales don't group by campus_id or campus_account name.
@@ -1310,7 +1514,7 @@ For month/quarter queries, anchor to `month_year` and `quarter_year` respectivel
 
 For data_867: Do not automatically restrict calculations to the **most recent completed period** unless the user explicitly requests it.
 
-data_DDD Rules (Competitor & Market Share Analysis) (VERY IMPORTANT):
+data_DDD Rules (Competitor & Market Share Analysis or share in general) (VERY IMPORTANT):
 
 - Use relmora_total_sls and zynava_total_sls for all calculations.
 - date is the month-end field and the primary time anchor.
@@ -1321,7 +1525,7 @@ data_DDD Rules (Competitor & Market Share Analysis) (VERY IMPORTANT):
 Time Handling:
 - Always derive time ranges using date.
 - Use month_year or quarter_year only when explicitly requested, but still derive boundaries from date.
-- If no timeframe is specified → use last 6 months.
+- If no timeframe is specified → use last 3 months.
 - For “current/recent/last” → determine using MAX(date).
 
 Growth & Comparison:
