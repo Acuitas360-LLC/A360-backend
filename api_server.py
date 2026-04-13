@@ -223,7 +223,7 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
-AUTH_REQUIRED = _env_flag("AUTH_REQUIRED", False)
+AUTH_REQUIRED = _env_flag("AUTH_REQUIRED", True)
 AZURE_AD_TENANT_ID = (
     os.getenv("AZURE_AD_TENANT_ID", "").strip()
     or os.getenv("MSAL_TENANT_ID", "").strip()
