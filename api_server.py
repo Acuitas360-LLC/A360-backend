@@ -19,7 +19,7 @@ from jwt import PyJWKClient
 import psycopg
 from psycopg_pool import ConnectionPool, PoolTimeout
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
@@ -38,7 +38,7 @@ if BACKEND_DIR not in sys.path:
 os.chdir(BACKEND_DIR)
 load_dotenv(os.path.join(BACKEND_DIR, ".env"))
 
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.checkpoint.memory import MemorySaver
 
 PostgresSaver = None
@@ -52,6 +52,7 @@ except Exception:
 class ChatRequest(BaseModel):
     question: str = Field(..., min_length=1)
     thread_id: str = Field(..., min_length=1)
+    downvoted_message_id: Optional[str] = None
 
 
 class ChatResponse(BaseModel):
@@ -71,8 +72,12 @@ class VoteRequest(BaseModel):
     thread_id: str = Field(..., min_length=1)
     message_id: str = Field(..., min_length=1)
     rating: int
+    phase: Optional[str] = None
     user_query: Optional[str] = None
     assistant_response: Optional[str] = None
+    feedback_text: Optional[str] = None
+    feedback_query_message_id: Optional[str] = None
+    feedback_response_message_id: Optional[str] = None
 
 
 class DailyPulseUpdateRequest(BaseModel):
@@ -83,6 +88,10 @@ DEFAULT_DAILY_PULSE_QUESTIONS: tuple[str, ...] = (
     "Are we seeing strong short-term sales momentum?",
     "How are we doing in terms of adding new businesses?",
 )
+
+FEEDBACK_ENRICHMENT_MAX_CHARS = 200000
+MAX_FEEDBACK_ENRICH_RETRIES = 3
+FEEDBACK_ENRICH_RETRY_DELAYS_SEC = (10, 30, 60)
 
 
 app = FastAPI(title="A360 Backend API", version="0.1.0")
@@ -407,6 +416,46 @@ def _init_feedback_db(conn: psycopg.Connection) -> None:
         """
     )
 
+    # Always keep feedback schema forward-compatible for already-bootstrapped deployments.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS message_feedback (
+            id SERIAL PRIMARY KEY,
+            user_id TEXT,
+            thread_id TEXT,
+            message_id TEXT,
+            feedback_query_message_id TEXT,
+            feedback_response_message_id TEXT,
+            user_query TEXT,
+            assistant_response TEXT,
+            rating INTEGER,
+            feedback_text TEXT,
+            result_summary TEXT,
+            sql_query TEXT,
+            sql_result_json TEXT,
+            chart_code TEXT,
+            visualization_figure_json TEXT,
+            followup_questions TEXT,
+            created_at TEXT,
+            enrich_status TEXT,
+            enrich_attempts INTEGER
+        )
+        """
+    )
+    conn.execute("ALTER TABLE message_feedback ADD COLUMN IF NOT EXISTS feedback_query_message_id TEXT")
+    conn.execute("ALTER TABLE message_feedback ADD COLUMN IF NOT EXISTS feedback_response_message_id TEXT")
+    conn.execute("ALTER TABLE message_feedback ADD COLUMN IF NOT EXISTS feedback_text TEXT")
+    conn.execute("ALTER TABLE message_feedback ADD COLUMN IF NOT EXISTS result_summary TEXT")
+    conn.execute("ALTER TABLE message_feedback ADD COLUMN IF NOT EXISTS sql_query TEXT")
+    conn.execute("ALTER TABLE message_feedback ADD COLUMN IF NOT EXISTS sql_result_json TEXT")
+    conn.execute("ALTER TABLE message_feedback ADD COLUMN IF NOT EXISTS chart_code TEXT")
+    conn.execute("ALTER TABLE message_feedback ADD COLUMN IF NOT EXISTS visualization_figure_json TEXT")
+    conn.execute("ALTER TABLE message_feedback ADD COLUMN IF NOT EXISTS followup_questions TEXT")
+    conn.execute("ALTER TABLE message_feedback ADD COLUMN IF NOT EXISTS updated_at TEXT")
+    conn.execute("ALTER TABLE message_feedback ADD COLUMN IF NOT EXISTS enriched_at TEXT")
+    conn.execute("ALTER TABLE message_feedback ADD COLUMN IF NOT EXISTS enrich_status TEXT")
+    conn.execute("ALTER TABLE message_feedback ADD COLUMN IF NOT EXISTS enrich_attempts INTEGER")
+
     bootstrap_migration_key = "schema_bootstrap_v2"
     bootstrap_row = conn.execute(
         "SELECT 1 FROM schema_migrations WHERE migration_key=%s",
@@ -423,10 +472,21 @@ def _init_feedback_db(conn: psycopg.Connection) -> None:
             user_id TEXT,
             thread_id TEXT,
             message_id TEXT,
+            feedback_query_message_id TEXT,
+            feedback_response_message_id TEXT,
             user_query TEXT,
             assistant_response TEXT,
             rating INTEGER,
-            created_at TEXT
+            feedback_text TEXT,
+            result_summary TEXT,
+            sql_query TEXT,
+            sql_result_json TEXT,
+            chart_code TEXT,
+            visualization_figure_json TEXT,
+            followup_questions TEXT,
+            created_at TEXT,
+            enrich_status TEXT,
+            enrich_attempts INTEGER
         )
         """
     )
@@ -471,6 +531,19 @@ def _init_feedback_db(conn: psycopg.Connection) -> None:
     # Ensure modern columns exist irrespective of older migration markers.
     conn.execute("ALTER TABLE thread_registry ADD COLUMN IF NOT EXISTS is_hidden BOOLEAN")
     conn.execute("ALTER TABLE thread_registry ADD COLUMN IF NOT EXISTS hidden_at TEXT")
+    conn.execute("ALTER TABLE message_feedback ADD COLUMN IF NOT EXISTS feedback_query_message_id TEXT")
+    conn.execute("ALTER TABLE message_feedback ADD COLUMN IF NOT EXISTS feedback_response_message_id TEXT")
+    conn.execute("ALTER TABLE message_feedback ADD COLUMN IF NOT EXISTS feedback_text TEXT")
+    conn.execute("ALTER TABLE message_feedback ADD COLUMN IF NOT EXISTS result_summary TEXT")
+    conn.execute("ALTER TABLE message_feedback ADD COLUMN IF NOT EXISTS sql_query TEXT")
+    conn.execute("ALTER TABLE message_feedback ADD COLUMN IF NOT EXISTS sql_result_json TEXT")
+    conn.execute("ALTER TABLE message_feedback ADD COLUMN IF NOT EXISTS chart_code TEXT")
+    conn.execute("ALTER TABLE message_feedback ADD COLUMN IF NOT EXISTS visualization_figure_json TEXT")
+    conn.execute("ALTER TABLE message_feedback ADD COLUMN IF NOT EXISTS followup_questions TEXT")
+    conn.execute("ALTER TABLE message_feedback ADD COLUMN IF NOT EXISTS updated_at TEXT")
+    conn.execute("ALTER TABLE message_feedback ADD COLUMN IF NOT EXISTS enriched_at TEXT")
+    conn.execute("ALTER TABLE message_feedback ADD COLUMN IF NOT EXISTS enrich_status TEXT")
+    conn.execute("ALTER TABLE message_feedback ADD COLUMN IF NOT EXISTS enrich_attempts INTEGER")
 
     # One-time legacy backfill/migration. Running this every startup can block history for minutes.
     if not migration_row:
@@ -716,12 +789,36 @@ def _table_ensure_statements(table_name: str) -> list[str]:
                 user_id TEXT,
                 thread_id TEXT,
                 message_id TEXT,
+                feedback_query_message_id TEXT,
+                feedback_response_message_id TEXT,
                 user_query TEXT,
                 assistant_response TEXT,
                 rating INTEGER,
-                created_at TEXT
+                feedback_text TEXT,
+                result_summary TEXT,
+                sql_query TEXT,
+                sql_result_json TEXT,
+                chart_code TEXT,
+                visualization_figure_json TEXT,
+                followup_questions TEXT,
+                created_at TEXT,
+                enrich_status TEXT,
+                enrich_attempts INTEGER
             )
             """,
+            "ALTER TABLE message_feedback ADD COLUMN IF NOT EXISTS feedback_query_message_id TEXT",
+            "ALTER TABLE message_feedback ADD COLUMN IF NOT EXISTS feedback_response_message_id TEXT",
+            "ALTER TABLE message_feedback ADD COLUMN IF NOT EXISTS feedback_text TEXT",
+            "ALTER TABLE message_feedback ADD COLUMN IF NOT EXISTS result_summary TEXT",
+            "ALTER TABLE message_feedback ADD COLUMN IF NOT EXISTS sql_query TEXT",
+            "ALTER TABLE message_feedback ADD COLUMN IF NOT EXISTS sql_result_json TEXT",
+            "ALTER TABLE message_feedback ADD COLUMN IF NOT EXISTS chart_code TEXT",
+            "ALTER TABLE message_feedback ADD COLUMN IF NOT EXISTS visualization_figure_json TEXT",
+            "ALTER TABLE message_feedback ADD COLUMN IF NOT EXISTS followup_questions TEXT",
+            "ALTER TABLE message_feedback ADD COLUMN IF NOT EXISTS updated_at TEXT",
+            "ALTER TABLE message_feedback ADD COLUMN IF NOT EXISTS enriched_at TEXT",
+            "ALTER TABLE message_feedback ADD COLUMN IF NOT EXISTS enrich_status TEXT",
+            "ALTER TABLE message_feedback ADD COLUMN IF NOT EXISTS enrich_attempts INTEGER",
             """
             CREATE UNIQUE INDEX IF NOT EXISTS message_feedback_user_thread_message_unique
             ON message_feedback (user_id, thread_id, message_id)
@@ -906,6 +1003,14 @@ def _ensure_db_pool() -> ConnectionPool:
             },
             open=True,
         )
+        with pool.connection() as conn:
+            previous_autocommit = conn.autocommit
+            try:
+                conn.autocommit = True
+                conn.execute(f"SET statement_timeout = {DB_BOOTSTRAP_STATEMENT_TIMEOUT_MS}")
+            finally:
+                conn.autocommit = previous_autocommit
+            _init_feedback_db(conn)
         db_pool = pool
         db_unavailable_until = None
         return pool
@@ -1117,6 +1222,125 @@ def _get_stream_subgraph() -> Any:
 
         stream_subgraph = build_stream_graph(checkpointer=None)
     return stream_subgraph
+
+
+def _load_checkpoint_messages_for_stream(thread_id: str, user_id: str) -> list[Any]:
+    """Best-effort retrieval of prior messages for stream continuity."""
+    checkpoint_messages: list[Any] = []
+    try:
+        chatbot_instance = _get_chatbot()
+        snapshot = chatbot_instance.get_state(
+            config={"configurable": {"thread_id": _checkpoint_thread_id(thread_id, user_id)}}
+        )
+        values = getattr(snapshot, "values", None)
+        if isinstance(values, dict):
+            messages = values.get("messages")
+            if isinstance(messages, list):
+                checkpoint_messages = messages
+    except Exception as exc:
+        logger.warning("Unable to load checkpoint messages for stream: %s", exc)
+
+    cached_messages = _reconstruct_langchain_messages_from_cache(thread_id, user_id)
+    if checkpoint_messages and cached_messages:
+        return checkpoint_messages if len(checkpoint_messages) >= len(cached_messages) else cached_messages
+    if checkpoint_messages:
+        return checkpoint_messages
+    return cached_messages
+
+
+def _reconstruct_langchain_messages_from_cache(thread_id: str, user_id: str) -> list[Any]:
+    """Convert cached history payload into LangChain messages for subgraph context."""
+    cached_messages = _load_cached_messages(thread_id, user_id)
+    reconstructed: list[Any] = []
+
+    for entry in cached_messages:
+        if not isinstance(entry, dict):
+            continue
+
+        role = str(entry.get("role") or "").strip().lower()
+        parts = entry.get("parts")
+        if not isinstance(parts, list):
+            continue
+
+        if role == "user":
+            text = _extract_message_text_from_parts(parts)
+            if text and text.strip():
+                reconstructed.append(HumanMessage(content=text.strip()))
+            continue
+
+        if role != "assistant":
+            continue
+
+        assistant_text: Optional[str] = None
+        sql_query: Optional[str] = None
+        result_summary: Optional[str] = None
+        sql_result: Optional[dict[str, Any]] = None
+        visualization_code: Optional[str] = None
+
+        for part in parts:
+            if not isinstance(part, dict):
+                continue
+            part_type = str(part.get("type") or "").strip()
+            part_data = part.get("data")
+
+            if part_type == "text":
+                text = _coerce_text(part.get("text"))
+                if text and text.strip():
+                    assistant_text = text.strip()
+            elif part_type == "data-sqlQuery":
+                sql_query = _coerce_text(part_data)
+            elif part_type == "data-resultSummary":
+                result_summary = _coerce_text(part_data)
+            elif part_type == "data-sqlResult" and isinstance(part_data, dict):
+                sql_result = part_data
+            elif part_type == "data-visualizationCode":
+                visualization_code = _coerce_text(part_data)
+
+        content_parts: list[str] = []
+        if sql_query:
+            content_parts.append("SQL Query Executed:\n" + sql_query)
+        if result_summary:
+            content_parts.append("Result Summary:\n" + result_summary)
+        if not content_parts and assistant_text:
+            content_parts.append(assistant_text)
+
+        if content_parts:
+            reconstructed.append(AIMessage(content="\n\n".join(content_parts).strip()))
+
+        if isinstance(sql_result, dict):
+            reconstructed.append(
+                AIMessage(
+                    content="SQL query results",
+                    additional_kwargs={"type": "sql_result", "data": sql_result},
+                )
+            )
+
+        if visualization_code:
+            reconstructed.append(
+                AIMessage(
+                    content="Visualization",
+                    additional_kwargs={"type": "visualization", "code": visualization_code},
+                )
+            )
+
+    return reconstructed
+
+
+def _seed_stream_messages(prior_messages: list[Any], question: str) -> list[Any]:
+    """Append current user message unless the prior tail already matches it."""
+    merged_messages = list(prior_messages)
+    question_text = str(question or "").strip()
+    if not merged_messages:
+        return [HumanMessage(content=question_text)]
+
+    last_message = merged_messages[-1]
+    last_type = getattr(last_message, "type", "")
+    last_content = _extract_text_from_content(getattr(last_message, "content", "")).strip()
+    if str(last_type).lower() in {"human", "humanmessage"} and last_content == question_text:
+        return merged_messages
+
+    merged_messages.append(HumanMessage(content=question_text))
+    return merged_messages
 
 
 def _parse_agent_output(text: str) -> dict[str, Optional[str]]:
@@ -1416,27 +1640,453 @@ def _feedback_exists(user_id: str, thread_id: str, message_id: str) -> bool:
     return row is not None
 
 
-def _save_feedback_if_missing(request: VoteRequest, user_id: str) -> bool:
-    if _feedback_exists(user_id, request.thread_id, request.message_id):
-        return False
+def _normalize_optional_text(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    cleaned = value.strip()
+    return cleaned or None
+
+
+def _extract_message_text_from_parts(parts: Any) -> Optional[str]:
+    if not isinstance(parts, list):
+        return None
+
+    chunks: list[str] = []
+    for part in parts:
+        if not isinstance(part, dict) or part.get("type") != "text":
+            continue
+        text = _coerce_text(part.get("text"))
+        if text and text.strip():
+            chunks.append(text.strip())
+
+    if not chunks:
+        return None
+    return "\n".join(chunks)
+
+
+def _json_text(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    try:
+        return json.dumps(value, ensure_ascii=True, default=str)
+    except Exception:
+        return None
+
+
+def _extract_feedback_enrichment_from_cache(
+    thread_id: str,
+    user_id: str,
+    message_id: str,
+) -> dict[str, Optional[str]]:
+    cached_messages = _load_cached_messages(thread_id, user_id)
+    if not cached_messages:
+        return {
+            "feedback_query_message_id": None,
+            "feedback_response_message_id": None,
+            "user_query": None,
+            "assistant_response": None,
+            "result_summary": None,
+            "sql_query": None,
+            "sql_result_json": None,
+            "chart_code": None,
+            "visualization_figure_json": None,
+            "followup_questions": None,
+        }
+
+    target_index: Optional[int] = None
+    target_message: Optional[dict[str, Any]] = None
+    for index, message in enumerate(cached_messages):
+        if not isinstance(message, dict):
+            continue
+        if str(message.get("id", "")) != message_id:
+            continue
+        target_index = index
+        target_message = message
+        break
+
+    if target_index is None or not isinstance(target_message, dict):
+        return {
+            "feedback_query_message_id": None,
+            "feedback_response_message_id": None,
+            "user_query": None,
+            "assistant_response": None,
+            "result_summary": None,
+            "sql_query": None,
+            "sql_result_json": None,
+            "chart_code": None,
+            "visualization_figure_json": None,
+            "followup_questions": None,
+        }
+
+    user_query: Optional[str] = None
+    for prior_index in range(target_index - 1, -1, -1):
+        prior = cached_messages[prior_index]
+        if not isinstance(prior, dict) or prior.get("role") != "user":
+            continue
+        user_query = _extract_message_text_from_parts(prior.get("parts"))
+        if user_query:
+            break
+
+    target_parts = target_message.get("parts")
+    assistant_response = _extract_message_text_from_parts(target_parts)
+    result_summary: Optional[str] = None
+    sql_query: Optional[str] = None
+    sql_result_json: Optional[str] = None
+    chart_code: Optional[str] = None
+    visualization_figure_json: Optional[str] = None
+    followup_questions: Optional[str] = None
+
+    if isinstance(target_parts, list):
+        for part in target_parts:
+            if not isinstance(part, dict):
+                continue
+            part_type = part.get("type")
+            if part_type == "data-resultSummary" and result_summary is None:
+                result_summary = _coerce_text(part.get("data"))
+                continue
+            if part_type == "data-sqlQuery" and sql_query is None:
+                sql_query = _coerce_text(part.get("data"))
+                continue
+            if part_type == "data-sqlResult" and sql_result_json is None:
+                sql_result_json = _json_text(part.get("data"))
+                continue
+            if part_type == "data-visualizationCode" and chart_code is None:
+                chart_code = _coerce_text(part.get("data"))
+                continue
+            if part_type == "data-visualizationFigure" and visualization_figure_json is None:
+                visualization_figure_json = _json_text(part.get("data"))
+                continue
+            if part_type == "data-relevantQuestions" and followup_questions is None:
+                followup_questions = _json_text(part.get("data"))
+
+    return {
+        "feedback_query_message_id": None,
+        "feedback_response_message_id": None,
+        "user_query": _truncate_text(user_query or "", FEEDBACK_ENRICHMENT_MAX_CHARS) or None,
+        "assistant_response": _truncate_text(assistant_response or "", FEEDBACK_ENRICHMENT_MAX_CHARS)
+        or None,
+        "result_summary": _truncate_text(result_summary or "", FEEDBACK_ENRICHMENT_MAX_CHARS) or None,
+        "sql_query": _truncate_text(sql_query or "", FEEDBACK_ENRICHMENT_MAX_CHARS) or None,
+        "sql_result_json": _truncate_text(sql_result_json or "", FEEDBACK_ENRICHMENT_MAX_CHARS)
+        or None,
+        "chart_code": _truncate_text(chart_code or "", FEEDBACK_ENRICHMENT_MAX_CHARS) or None,
+        "visualization_figure_json": _truncate_text(
+            visualization_figure_json or "", FEEDBACK_ENRICHMENT_MAX_CHARS
+        )
+        or None,
+        "followup_questions": _truncate_text(
+            followup_questions or "", FEEDBACK_ENRICHMENT_MAX_CHARS
+        )
+        or None,
+    }
+
+
+def _validate_feedback_message_ids_against_cache(
+    *,
+    thread_id: str,
+    user_id: str,
+    message_id: str,
+    feedback_query_message_id: Optional[str],
+    feedback_response_message_id: Optional[str],
+) -> tuple[bool, Optional[str]]:
+    cached_messages = _load_cached_messages(thread_id, user_id)
+    if not cached_messages:
+        return False, "Thread message cache is not ready yet"
+
+    message_index: dict[str, dict[str, Any]] = {}
+    for entry in cached_messages:
+        if not isinstance(entry, dict):
+            continue
+        cached_id = _coerce_text(entry.get("id"))
+        if not cached_id:
+            continue
+        if cached_id not in message_index:
+            message_index[cached_id] = entry
+
+    def _check_id(
+        field_name: str,
+        value: Optional[str],
+        expected_role: str,
+    ) -> tuple[bool, Optional[str]]:
+        if not value:
+            return True, None
+
+        cached = message_index.get(value)
+        if not cached:
+            return False, f"{field_name} was not found in the thread cache"
+
+        cached_role = str(cached.get("role", "")).strip().lower()
+        if cached_role != expected_role:
+            return False, f"{field_name} must reference a {expected_role} message"
+
+        return True, None
+
+    checks = (
+        ("message_id", message_id, "assistant"),
+        ("feedback_query_message_id", feedback_query_message_id, "user"),
+        ("feedback_response_message_id", feedback_response_message_id, "assistant"),
+    )
+    for field_name, value, expected_role in checks:
+        ok, error = _check_id(field_name, value, expected_role)
+        if not ok:
+            return False, error
+
+    return True, None
+
+
+def _save_feedback_vote(request: VoteRequest, user_id: str) -> tuple[bool, bool]:
+    inserted = not _feedback_exists(user_id, request.thread_id, request.message_id)
+    now_iso = datetime.now(UTC).isoformat()
 
     _db_execute(
         """
-        INSERT INTO message_feedback
-        (user_id, thread_id, message_id, user_query, assistant_response, rating, created_at)
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        INSERT INTO message_feedback (
+            user_id,
+            thread_id,
+            message_id,
+            rating,
+            created_at,
+            updated_at,
+            enrich_status,
+            enrich_attempts
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, 'pending', 0)
+        ON CONFLICT (user_id, thread_id, message_id)
+        DO UPDATE SET
+            rating = EXCLUDED.rating,
+            updated_at = EXCLUDED.updated_at
         """,
         (
             user_id,
             request.thread_id,
             request.message_id,
-            request.user_query,
-            request.assistant_response,
             request.rating,
-            datetime.now(UTC).isoformat(),
+            now_iso,
+            now_iso,
+        ),
+    )
+
+    return inserted, not inserted
+
+
+def _save_feedback_text(request: VoteRequest, user_id: str) -> tuple[bool, bool]:
+    inserted = not _feedback_exists(user_id, request.thread_id, request.message_id)
+    now_iso = datetime.now(UTC).isoformat()
+
+    feedback_text = _normalize_optional_text(request.feedback_text)
+    if not feedback_text:
+        raise HTTPException(status_code=400, detail="feedback_text is required for feedback_only phase")
+
+    _db_execute(
+        """
+        INSERT INTO message_feedback (
+            user_id,
+            thread_id,
+            message_id,
+            feedback_text,
+            created_at,
+            updated_at,
+            enrich_status,
+            enrich_attempts
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, 'pending', 0)
+        ON CONFLICT (user_id, thread_id, message_id)
+        DO UPDATE SET
+            feedback_text = EXCLUDED.feedback_text,
+            updated_at = EXCLUDED.updated_at,
+            enrich_status = 'pending',
+            enrich_attempts = 0
+        """,
+        (
+            user_id,
+            request.thread_id,
+            request.message_id,
+            feedback_text,
+            now_iso,
+            now_iso,
+        ),
+    )
+    return inserted, not inserted
+
+
+def _link_feedback_retry_ids_from_stream(
+    *,
+    user_id: str,
+    thread_id: str,
+    downvoted_message_id: Optional[str],
+    feedback_query_message_id: str,
+    feedback_response_message_id: str,
+) -> None:
+    anchor_message_id = _normalize_optional_text(downvoted_message_id)
+    if not anchor_message_id:
+        return
+
+    if not _feedback_exists(user_id, thread_id, anchor_message_id):
+        return
+
+    valid_ids, validation_error = _validate_feedback_message_ids_against_cache(
+        thread_id=thread_id,
+        user_id=user_id,
+        message_id=anchor_message_id,
+        feedback_query_message_id=feedback_query_message_id,
+        feedback_response_message_id=feedback_response_message_id,
+    )
+    if not valid_ids:
+        logger.warning(
+            "feedback-link skipped user=%s thread=%s message=%s reason=%s",
+            user_id,
+            thread_id,
+            anchor_message_id,
+            validation_error or "validation_failed",
+        )
+        return
+
+    now_iso = datetime.now(UTC).isoformat()
+    _db_execute(
+        """
+        UPDATE message_feedback
+        SET
+            feedback_query_message_id = COALESCE(message_feedback.feedback_query_message_id, %s),
+            feedback_response_message_id = COALESCE(
+                message_feedback.feedback_response_message_id,
+                %s
+            ),
+            updated_at = %s
+        WHERE user_id=%s AND thread_id=%s AND message_id=%s
+        """,
+        (
+            feedback_query_message_id,
+            feedback_response_message_id,
+            now_iso,
+            user_id,
+            thread_id,
+            anchor_message_id,
+        ),
+    )
+
+
+def _enrich_feedback_vote_record(request: VoteRequest, user_id: str) -> bool:
+    enrichment = _extract_feedback_enrichment_from_cache(
+        thread_id=request.thread_id,
+        user_id=user_id,
+        message_id=request.message_id,
+    )
+    if not any(enrichment.values()):
+        return False
+
+    now_iso = datetime.now(UTC).isoformat()
+    _db_execute(
+        """
+        UPDATE message_feedback
+        SET
+            user_query = COALESCE(message_feedback.user_query, %s),
+            assistant_response = COALESCE(message_feedback.assistant_response, %s),
+            result_summary = COALESCE(message_feedback.result_summary, %s),
+            sql_query = COALESCE(message_feedback.sql_query, %s),
+            sql_result_json = COALESCE(message_feedback.sql_result_json, %s),
+            chart_code = COALESCE(message_feedback.chart_code, %s),
+            visualization_figure_json = COALESCE(message_feedback.visualization_figure_json, %s),
+            followup_questions = COALESCE(message_feedback.followup_questions, %s),
+            enriched_at = %s,
+            updated_at = %s
+        WHERE user_id=%s AND thread_id=%s AND message_id=%s
+        """,
+        (
+            enrichment["user_query"],
+            enrichment["assistant_response"],
+            enrichment["result_summary"],
+            enrichment["sql_query"],
+            enrichment["sql_result_json"],
+            enrichment["chart_code"],
+            enrichment["visualization_figure_json"],
+            enrichment["followup_questions"],
+            now_iso,
+            now_iso,
+            user_id,
+            request.thread_id,
+            request.message_id,
         ),
     )
     return True
+
+
+def _set_feedback_enrich_state(
+    *,
+    user_id: str,
+    thread_id: str,
+    message_id: str,
+    status: str,
+    attempts: Optional[int] = None,
+) -> None:
+    if attempts is None:
+        _db_execute(
+            """
+            UPDATE message_feedback
+            SET enrich_status=%s, updated_at=%s
+            WHERE user_id=%s AND thread_id=%s AND message_id=%s
+            """,
+            (
+                status,
+                datetime.now(UTC).isoformat(),
+                user_id,
+                thread_id,
+                message_id,
+            ),
+        )
+        return
+
+    _db_execute(
+        """
+        UPDATE message_feedback
+        SET enrich_status=%s, enrich_attempts=%s, updated_at=%s
+        WHERE user_id=%s AND thread_id=%s AND message_id=%s
+        """,
+        (
+            status,
+            attempts,
+            datetime.now(UTC).isoformat(),
+            user_id,
+            thread_id,
+            message_id,
+        ),
+    )
+
+
+def _run_feedback_enrichment_with_retries(request: VoteRequest, user_id: str) -> None:
+    for attempt_index in range(MAX_FEEDBACK_ENRICH_RETRIES):
+        attempt_number = attempt_index + 1
+        _set_feedback_enrich_state(
+            user_id=user_id,
+            thread_id=request.thread_id,
+            message_id=request.message_id,
+            status="running",
+            attempts=attempt_number,
+        )
+
+        try:
+            enriched = _enrich_feedback_vote_record(request, user_id)
+            if enriched:
+                _set_feedback_enrich_state(
+                    user_id=user_id,
+                    thread_id=request.thread_id,
+                    message_id=request.message_id,
+                    status="done",
+                    attempts=attempt_number,
+                )
+                return
+        except Exception:
+            pass
+
+        if attempt_index < len(FEEDBACK_ENRICH_RETRY_DELAYS_SEC):
+            time.sleep(FEEDBACK_ENRICH_RETRY_DELAYS_SEC[attempt_index])
+
+    _set_feedback_enrich_state(
+        user_id=user_id,
+        thread_id=request.thread_id,
+        message_id=request.message_id,
+        status="failed_final",
+        attempts=MAX_FEEDBACK_ENRICH_RETRIES,
+    )
 
 
 def _extract_thread_timestamp(thread_id: str) -> datetime:
@@ -2273,6 +2923,7 @@ def _sse_event(event_name: str, payload: dict[str, Any]) -> str:
 async def chat_stream(request: ChatRequest, raw_request: Request) -> StreamingResponse:
     current_user = _get_request_user(raw_request)
     current_user_id = current_user["user_id"]
+    downvoted_message_id = _normalize_optional_text(request.downvoted_message_id)
 
     async def event_generator():
         final_summary_text: str = ""
@@ -2344,6 +2995,14 @@ async def chat_stream(request: ChatRequest, raw_request: Request) -> StreamingRe
             cached_messages.extend([user_message, assistant_message])
             _save_cached_messages(request.thread_id, current_user_id, cached_messages)
 
+            _link_feedback_retry_ids_from_stream(
+                user_id=current_user_id,
+                thread_id=request.thread_id,
+                downvoted_message_id=downvoted_message_id,
+                feedback_query_message_id=user_message["id"],
+                feedback_response_message_id=assistant_message["id"],
+            )
+
         try:
             yield _sse_event(
                 "status",
@@ -2356,7 +3015,6 @@ async def chat_stream(request: ChatRequest, raw_request: Request) -> StreamingRe
             _register_thread_if_missing(request.thread_id, current_user_id)
             _set_thread_title_if_missing(request.thread_id, current_user_id, request.question)
 
-            seed_message = HumanMessage(content=request.question)
             sql_generator_rag_examples_text, query_decomposer_rag_examples_text, relevant_questions = (
                 await asyncio.to_thread(_build_rag_examples_for_question, request.question)
             )
@@ -2376,10 +3034,21 @@ async def chat_stream(request: ChatRequest, raw_request: Request) -> StreamingRe
                     "thread_id": _checkpoint_thread_id(request.thread_id, current_user_id)
                 }
             }
+            prior_messages = _load_checkpoint_messages_for_stream(
+                request.thread_id,
+                current_user_id,
+            )
+            stream_messages = _seed_stream_messages(prior_messages, request.question)
+            logger.info(
+                "stream_context thread_id=%s prior_messages=%s seeded_messages=%s",
+                request.thread_id,
+                len(prior_messages),
+                len(stream_messages),
+            )
 
             initial_state: dict[str, Any] = {
                 "question": request.question,
-                "messages": [seed_message],
+                "messages": stream_messages,
                 "run_id": datetime.now(UTC).isoformat() + "Z",
                 "last_output": "",
                 "query_decomposer_output": None,
@@ -2677,6 +3346,8 @@ async def chat_stream(request: ChatRequest, raw_request: Request) -> StreamingRe
             if final_summary_text.strip():
                 _persist_stream_messages(always=False)
 
+            logger.exception("chat_stream failed for thread_id=%s", request.thread_id)
+
             yield _sse_event(
                 "error",
                 {
@@ -2968,11 +3639,104 @@ def get_votes(thread_id: str, raw_request: Request) -> list[dict[str, Any]]:
 
 
 @app.patch("/api/v1/votes")
-def save_vote(request: VoteRequest, raw_request: Request) -> dict[str, Any]:
+def save_vote(
+    request: VoteRequest,
+    raw_request: Request,
+    background_tasks: BackgroundTasks,
+) -> dict[str, Any]:
     current_user = _get_request_user(raw_request)
     current_user_id = current_user["user_id"]
     if not _is_thread_visible(None, request.thread_id, current_user_id):
         raise HTTPException(status_code=404, detail="Thread not found")
 
-    inserted = _save_feedback_if_missing(request, current_user_id)
-    return {"success": True, "inserted": inserted}
+    normalized_feedback_query_message_id = _normalize_optional_text(
+        request.feedback_query_message_id
+    )
+    normalized_feedback_response_message_id = _normalize_optional_text(
+        request.feedback_response_message_id
+    )
+    request.feedback_query_message_id = normalized_feedback_query_message_id
+    request.feedback_response_message_id = normalized_feedback_response_message_id
+
+    phase = (_normalize_optional_text(request.phase) or "rating_only").lower()
+    request.phase = phase
+
+    if phase not in {"rating_only", "feedback_only", "enrich_only"}:
+        raise HTTPException(status_code=400, detail="Invalid vote phase")
+
+    if phase == "rating_only":
+        if _normalize_optional_text(request.feedback_text):
+            raise HTTPException(status_code=400, detail="feedback_text is not allowed for rating_only phase")
+        if _normalize_optional_text(request.user_query) or _normalize_optional_text(request.assistant_response):
+            raise HTTPException(
+                status_code=400,
+                detail="user_query and assistant_response are not allowed for rating_only phase",
+            )
+
+    if phase == "feedback_only":
+        if not _normalize_optional_text(request.feedback_text):
+            raise HTTPException(status_code=400, detail="feedback_text is required for feedback_only phase")
+        if _normalize_optional_text(request.user_query) or _normalize_optional_text(request.assistant_response):
+            raise HTTPException(
+                status_code=400,
+                detail="user_query and assistant_response are not allowed for feedback_only phase",
+            )
+
+    # Initial vote writes should not fail on transient cache lag.
+    # Run strict cache-role validation only when explicit C/D linkage ids are provided.
+    requires_linkage_validation = bool(
+        normalized_feedback_query_message_id or normalized_feedback_response_message_id
+    )
+    if requires_linkage_validation:
+        valid_ids, validation_error = _validate_feedback_message_ids_against_cache(
+            thread_id=request.thread_id,
+            user_id=current_user_id,
+            message_id=request.message_id,
+            feedback_query_message_id=normalized_feedback_query_message_id,
+            feedback_response_message_id=normalized_feedback_response_message_id,
+        )
+        if not valid_ids:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "success": False,
+                    "retriable": True,
+                    "detail": validation_error or "Message IDs are not available yet",
+                },
+            )
+
+    if phase == "rating_only":
+        inserted, updated = _save_feedback_vote(request, current_user_id)
+        if request.rating == 1:
+            background_tasks.add_task(
+                _run_feedback_enrichment_with_retries,
+                request,
+                current_user_id,
+            )
+        return {
+            "success": True,
+            "inserted": inserted,
+            "updated": updated,
+            "phase": phase,
+        }
+
+    if phase == "feedback_only":
+        inserted, updated = _save_feedback_text(request, current_user_id)
+        background_tasks.add_task(
+            _run_feedback_enrichment_with_retries,
+            request,
+            current_user_id,
+        )
+        return {
+            "success": True,
+            "inserted": inserted,
+            "updated": updated,
+            "phase": phase,
+        }
+
+    background_tasks.add_task(
+        _run_feedback_enrichment_with_retries,
+        request,
+        current_user_id,
+    )
+    return {"success": True, "phase": phase, "inserted": False, "updated": True}
