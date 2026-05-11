@@ -1218,7 +1218,7 @@ def _get_chatbot() -> Any:
 def _get_stream_subgraph() -> Any:
     global stream_subgraph
     if stream_subgraph is None:
-        from subgraph_7 import build_graph as build_stream_graph
+        from subgraph_10 import build_graph as build_stream_graph
 
         stream_subgraph = build_stream_graph(checkpointer=None)
     return stream_subgraph

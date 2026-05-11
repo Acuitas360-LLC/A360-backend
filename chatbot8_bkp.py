@@ -3,7 +3,7 @@ from langgraph.graph.message import add_messages
 from typing import TypedDict, Annotated
 from langchain_core.messages import BaseMessage, AIMessage
 from langchain_openai import ChatOpenAI
-from subgraph_10 import build_graph
+from subgraph_7 import build_graph
 from datetime import datetime, UTC
 from dotenv import load_dotenv
 from langgraph.checkpoint.memory import MemorySaver
@@ -215,41 +215,6 @@ def get_intent_summary(user_query):
         Output:
         {{
         "intent_summary": "Assess whether market share is being gained or lost by campus tier across regions by comparing recent 3 months versus prior 3 months using the market share dataset, and add a performance-vs-nation column based on whether each tier-region segment's share change is higher or lower than the national share change."
-        }}
-
-        Input:
-        "What are the average calls per day across regions?"
-        Output:
-        {{
-        "intent_summary": "Calculate average calls per day across regions using calls_data for call activity and territory_effort for effort day denominators, defaulting to the most recent 3 completed calendar months. The calculation must be performed at the monthly level first, anchored to month_year for total calls, then rolled up to region across the selected months as total monthly calls divided by total monthly effort days"
-        }}
-
-        Input:
-        "What are the average touches per day across territories?" 
-        Output:
-        {{
-        "intent_summary": "Calculate the average touches per day for each campus territory using calls_data filtered to TOUCH activity and territory_effort as the denominator source, defaulting to the most recent 3 completed calendar months anchored to the latest available call_date in calls_data, while avoiding any lateral join dependency."
-        }}
-
-        Input:
-        "What is the call effort by tier across regions?" 
-        Output:
-        {{
-        "intent_summary": "Calculate call effort as total call count by campus tier across regions using call-level data, defaulting to the most recent 3 completed months, and include effort percentage within each region-tier combination relative to total national call effort for the same period."
-        }}
-
-        Input:
-        "What is the reach by tier across regions?" 
-        Output:
-        {{
-        "intent_summary": "Calculate call-based reach by campus tier across regions for the default most recent 13 weeks of available data, using only target campuses. Reach is defined as distinct target campuses reached divided by distinct total target campuses, grouped by campus_region and campus_tier."
-        }}
-
-        Input:
-        "What is the call frequency across regions?" 
-        Output:
-        {{
-        "intent_summary": "Calculate call frequency by region for the default most recent 13 weeks of available call data, using calls_data only. Call frequency is defined as unique call count divided by distinct campus count, grouped by campus_region_id and campus_region, with the rolling window anchored to the maximum week_end_date in calls_data."
         }}
 
 
@@ -511,7 +476,6 @@ def build_chatbot(checkpointer):
         messages = state["messages"]
         intent=get_intent_summary(messages[-1].content)
         sql_generator_rag_examples_text, query_decomposer_rag_examples_text, relevant_questions =build_rag_examples(messages[-1].content,intent)
-
 
         initial_state = {
             "question": messages[-1].content,
