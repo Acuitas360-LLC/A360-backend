@@ -3,7 +3,7 @@ from langgraph.graph.message import add_messages
 from typing import TypedDict, Annotated
 from langchain_core.messages import BaseMessage, AIMessage
 from langchain_openai import ChatOpenAI
-from subgraph_10 import build_graph
+from subgraph_14 import build_graph
 from datetime import datetime, UTC
 from dotenv import load_dotenv
 from langgraph.checkpoint.memory import MemorySaver
@@ -257,6 +257,14 @@ def get_intent_summary(user_query):
         {{"intent_summary": "<canonical intent>"}}
     """
     response = model.invoke([HumanMessage(content=prompt)])
+    # usage = response.usage_metadata
+    # input_tokens = usage.get("input_tokens", 0)
+    # output_tokens = usage.get("output_tokens", 0)
+    # total_tokens = usage.get("total_tokens", 0)
+    # print("\n===== Intent Summary TOKEN USAGE =====")
+    # print(f"Input Tokens: {input_tokens}")
+    # print(f"Output Tokens: {output_tokens}")
+    # print(f"Total Tokens: {total_tokens}")
     raw_text = response.content.strip()
 
     try:

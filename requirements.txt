@@ -15,3 +15,4 @@ gunicorn
 pandas
 plotly
 PyJWT
+python-pptx

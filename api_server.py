@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import os
+import tempfile
 import re
 import sys
 import uuid
 import json
+import base64
 import asyncio
 import random
 import threading
 import logging
 import time
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from importlib import import_module
 from datetime import UTC, datetime, timedelta
@@ -20,7 +23,7 @@ import psycopg
 from psycopg_pool import ConnectionPool, PoolTimeout
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 import pandas as pd
@@ -80,8 +83,19 @@ class VoteRequest(BaseModel):
     feedback_response_message_id: Optional[str] = None
 
 
+class PptGenerationRequest(BaseModel):
+    thread_id: str = Field(..., min_length=1)
+    message_id: Optional[str] = None
+    disposition: Optional[str] = None
+
+
 class DailyPulseUpdateRequest(BaseModel):
     questions: list[str] = Field(default_factory=list)
+
+
+class SuggestionItem(BaseModel):
+    question: str
+    score: float
 
 
 DEFAULT_DAILY_PULSE_QUESTIONS: tuple[str, ...] = (
@@ -1203,6 +1217,174 @@ def _build_rag_examples_for_question(question: str) -> tuple[str, str, list[str]
     return build_rag_examples(question, intent)
 
 
+def _normalize_suggestion_text(text: str) -> str:
+    return " ".join(text.strip().lower().split())
+
+
+SUGGESTION_CACHE_TTL_SECONDS = int(os.getenv("SUGGESTION_CACHE_TTL_SECONDS", "120"))
+SUGGESTION_CACHE_MAX_ITEMS = int(os.getenv("SUGGESTION_CACHE_MAX_ITEMS", "200"))
+_suggestion_cache: "OrderedDict[str, tuple[float, list[SuggestionItem]]]" = OrderedDict()
+_suggestion_cache_lock = threading.Lock()
+
+
+def _suggestion_cache_key(query: str) -> str:
+    return _normalize_suggestion_text(query)
+
+
+def _get_cached_suggestions(query: str) -> Optional[list[SuggestionItem]]:
+    key = _suggestion_cache_key(query)
+    now = time.time()
+    with _suggestion_cache_lock:
+        entry = _suggestion_cache.get(key)
+        if not entry:
+            return None
+        created_at, items = entry
+        if now - created_at > SUGGESTION_CACHE_TTL_SECONDS:
+            _suggestion_cache.pop(key, None)
+            return None
+        _suggestion_cache.move_to_end(key)
+        return items
+
+
+def _set_cached_suggestions(query: str, items: list[SuggestionItem]) -> None:
+    key = _suggestion_cache_key(query)
+    with _suggestion_cache_lock:
+        _suggestion_cache[key] = (time.time(), items)
+        _suggestion_cache.move_to_end(key)
+        while len(_suggestion_cache) > SUGGESTION_CACHE_MAX_ITEMS:
+            _suggestion_cache.popitem(last=False)
+
+
+def _prefix_search_snowflake(query: str, limit: int = 5) -> list[dict[str, Any]]:
+    if not query:
+        return []
+    from chatbot8 import run_snowflake_query
+
+    safe_query = query.replace("'", "''")
+    sql = f"""
+    SELECT question
+    FROM rag_payload
+    WHERE LOWER(question) LIKE LOWER('{safe_query}%')
+    ORDER BY question
+    LIMIT {max(1, limit)}
+    """
+    try:
+        df = run_snowflake_query(sql)
+    except Exception as exc:
+        logger.warning("Prefix suggestion query failed: %s", exc)
+        return []
+
+    results: list[dict[str, Any]] = []
+    for _, row in df.iterrows():
+        question = str(row.get("QUESTION") or row.get("question") or "").strip()
+        if question:
+            results.append({"question": question, "score": 0.35})
+    return results
+
+
+def _extract_suggestion_tokens(query: str) -> list[str]:
+    tokens = re.findall(r"[a-z0-9]+", query.lower())
+    return [token for token in tokens if len(token) >= 3]
+
+
+def _keyword_search_snowflake(query: str, limit: int = 5) -> list[dict[str, Any]]:
+    if not query:
+        return []
+    tokens = _extract_suggestion_tokens(query)
+    if not tokens:
+        return []
+    from chatbot8 import run_snowflake_query
+
+    like_clauses: list[str] = []
+    for token in tokens:
+        safe_token = token.replace("'", "''")
+        like_clauses.append(f"LOWER(question) LIKE '%{safe_token}%'")
+
+    sql = f"""
+    SELECT question
+    FROM rag_payload
+    WHERE {" OR ".join(like_clauses)}
+    ORDER BY question
+    LIMIT {max(1, limit)}
+    """
+    try:
+        df = run_snowflake_query(sql)
+    except Exception as exc:
+        logger.warning("Keyword suggestion query failed: %s", exc)
+        return []
+
+    results: list[dict[str, Any]] = []
+    for _, row in df.iterrows():
+        question = str(row.get("QUESTION") or row.get("question") or "").strip()
+        if question:
+            results.append({"question": question, "score": 0.55})
+    return results
+
+
+def _semantic_search_snowflake(query: str, limit: int = 5) -> list[dict[str, Any]]:
+    from chatbot8 import search_snowflake
+
+    try:
+        raw_results = search_snowflake(user_query=query, intent=query, top_k=limit)
+    except Exception as exc:
+        logger.warning("Semantic suggestion search failed: %s", exc)
+        return []
+
+    results: list[dict[str, Any]] = []
+    for row in raw_results:
+        question = str(row.get("matched_question") or "").strip()
+        score = float(row.get("score") or 0.0)
+        if question:
+            results.append({"question": question, "score": score})
+    return results
+
+
+def _merge_suggestions(
+    sources: list[tuple[str, list[dict[str, Any]]]],
+    limit: int = 5,
+) -> list[dict[str, Any]]:
+    priority = {"semantic": 0, "keyword": 1, "prefix": 2}
+    merged: dict[str, dict[str, Any]] = {}
+    for source_name, source in sources:
+        source_priority = priority.get(source_name, 99)
+        for item in source:
+            question = str(item.get("question") or "").strip()
+            if not question:
+                continue
+            key = _normalize_suggestion_text(question)
+            score = float(item.get("score") or 0.0)
+            existing = merged.get(key)
+            if existing is None:
+                merged[key] = {
+                    "question": question,
+                    "score": score,
+                    "_priority": source_priority,
+                }
+                continue
+            existing_priority = int(existing.get("_priority", 99))
+            if source_priority < existing_priority:
+                merged[key] = {
+                    "question": question,
+                    "score": score,
+                    "_priority": source_priority,
+                }
+            elif source_priority == existing_priority and score > float(existing.get("score") or 0.0):
+                merged[key]["score"] = score
+
+    ranked = sorted(
+        merged.values(),
+        key=lambda item: (
+            int(item.get("_priority", 99)),
+            -float(item.get("score") or 0.0),
+            item.get("question") or "",
+        ),
+    )
+    trimmed = ranked[: max(1, limit)]
+    for item in trimmed:
+        item.pop("_priority", None)
+    return trimmed
+
+
 def _get_chatbot() -> Any:
     global checkpointer
     global chatbot
@@ -1218,7 +1400,7 @@ def _get_chatbot() -> Any:
 def _get_stream_subgraph() -> Any:
     global stream_subgraph
     if stream_subgraph is None:
-        from subgraph_10 import build_graph as build_stream_graph
+        from subgraph_14 import build_graph as build_stream_graph
 
         stream_subgraph = build_stream_graph(checkpointer=None)
     return stream_subgraph
@@ -1251,6 +1433,10 @@ def _load_checkpoint_messages_for_stream(thread_id: str, user_id: str) -> list[A
 def _reconstruct_langchain_messages_from_cache(thread_id: str, user_id: str) -> list[Any]:
     """Convert cached history payload into LangChain messages for subgraph context."""
     cached_messages = _load_cached_messages(thread_id, user_id)
+    return _build_langchain_messages_from_cached(cached_messages)
+
+
+def _build_langchain_messages_from_cached(cached_messages: list[dict[str, Any]]) -> list[Any]:
     reconstructed: list[Any] = []
 
     for entry in cached_messages:
@@ -1276,6 +1462,7 @@ def _reconstruct_langchain_messages_from_cache(thread_id: str, user_id: str) -> 
         result_summary: Optional[str] = None
         sql_result: Optional[dict[str, Any]] = None
         visualization_code: Optional[str] = None
+        visualization_figure: Optional[dict[str, Any]] = None
 
         for part in parts:
             if not isinstance(part, dict):
@@ -1295,6 +1482,8 @@ def _reconstruct_langchain_messages_from_cache(thread_id: str, user_id: str) -> 
                 sql_result = part_data
             elif part_type == "data-visualizationCode":
                 visualization_code = _coerce_text(part_data)
+            elif part_type == "data-visualizationFigure" and isinstance(part_data, dict):
+                visualization_figure = part_data
 
         content_parts: list[str] = []
         if sql_query:
@@ -1315,11 +1504,16 @@ def _reconstruct_langchain_messages_from_cache(thread_id: str, user_id: str) -> 
                 )
             )
 
-        if visualization_code:
+        if visualization_code or visualization_figure:
+            visualization_kwargs: dict[str, Any] = {"type": "visualization"}
+            if visualization_code:
+                visualization_kwargs["code"] = visualization_code
+            if visualization_figure:
+                visualization_kwargs["figure"] = visualization_figure
             reconstructed.append(
                 AIMessage(
                     content="Visualization",
-                    additional_kwargs={"type": "visualization", "code": visualization_code},
+                    additional_kwargs=visualization_kwargs,
                 )
             )
 
@@ -2689,6 +2883,140 @@ def _serialize_thread_messages_with_timeout(
     return []
 
 
+PPTX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+
+
+def _load_thread_messages_for_ppt(thread_id: str, user_id: str) -> list[dict[str, Any]]:
+    cached_messages = _load_cached_messages(thread_id, user_id)
+    if cached_messages:
+        return cached_messages
+
+    chatbot_instance = _get_chatbot()
+    serialized = _serialize_thread_messages_with_timeout(
+        chatbot_instance,
+        thread_id,
+        user_id,
+    )
+    if serialized:
+        _save_cached_messages(thread_id, user_id, serialized)
+    return serialized
+
+
+def _select_user_assistant_pair(
+    cached_messages: list[dict[str, Any]],
+    assistant_message_id: str,
+) -> list[dict[str, Any]]:
+    target_index: Optional[int] = None
+    for index, message in enumerate(cached_messages):
+        if not isinstance(message, dict):
+            continue
+        if str(message.get("id") or "") == assistant_message_id:
+            target_index = index
+            break
+
+    if target_index is None:
+        raise HTTPException(status_code=404, detail="Assistant message not found")
+
+    target_message = cached_messages[target_index]
+    if str(target_message.get("role") or "").strip().lower() != "assistant":
+        raise HTTPException(status_code=400, detail="message_id must reference an assistant message")
+
+    user_message: Optional[dict[str, Any]] = None
+    for prior_index in range(target_index - 1, -1, -1):
+        prior = cached_messages[prior_index]
+        if not isinstance(prior, dict):
+            continue
+        if str(prior.get("role") or "").strip().lower() == "user":
+            user_message = prior
+            break
+
+    if user_message is None:
+        raise HTTPException(status_code=404, detail="No prior user message found for assistant")
+
+    return [user_message, target_message]
+
+
+def _sanitize_filename(value: str, fallback: str = "presentation") -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9_-]+", "_", (value or "").strip())
+    cleaned = re.sub(r"_+", "_", cleaned).strip("_")
+    if not cleaned:
+        cleaned = fallback
+    return cleaned[:60]
+
+
+def _build_ppt_filename(thread_title: str, suffix: str) -> str:
+    base = _sanitize_filename(thread_title)
+    timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+    return f"{base}_{suffix}_{timestamp}.pptx"
+
+
+def _normalize_disposition(value: Optional[str]) -> str:
+    normalized = (value or "").strip().lower() or "attachment"
+    if normalized not in {"inline", "attachment"}:
+        raise HTTPException(status_code=400, detail="Invalid disposition")
+    return normalized
+
+
+def _build_temp_ppt_path() -> str:
+    return os.path.join(tempfile.gettempdir(), f"ppt_{uuid.uuid4().hex}.pptx")
+
+
+def _safe_unlink(path: str) -> None:
+    try:
+        if path and os.path.exists(path):
+            os.remove(path)
+    except Exception:
+        pass
+
+
+def _generate_ppt_file(messages: list[Any], output_path: str) -> str:
+    from deck_creator_agent_7 import build_ppt
+
+    template_path = os.getenv("PPT_TEMPLATE_PATH", "").strip()
+    logo_path = os.getenv("PPT_LOGO_PATH", "").strip()
+    kwargs: dict[str, Any] = {"output_path": output_path}
+    if template_path:
+        kwargs["uploaded_pptx_path"] = template_path
+    if logo_path:
+        kwargs["logo_path"] = logo_path
+
+    return build_ppt(messages, **kwargs)
+
+
+def _encode_chart_image(chart_path: Optional[str]) -> Optional[str]:
+    if not chart_path or not os.path.exists(chart_path):
+        return None
+
+    try:
+        with open(chart_path, "rb") as handle:
+            encoded = base64.b64encode(handle.read()).decode("ascii")
+        return f"data:image/png;base64,{encoded}"
+    except Exception:
+        return None
+
+
+def _build_preview_payload(messages: list[Any]) -> list[dict[str, Any]]:
+    from deck_creator_agent_7 import build_slide_data
+
+    slides = build_slide_data(messages)
+    payload: list[dict[str, Any]] = []
+    for slide in slides:
+        chart_path = slide.get("chart_path") if isinstance(slide, dict) else None
+        payload.append(
+            {
+                "title": slide.get("title"),
+                "bullets": slide.get("bullets"),
+                "kpis": slide.get("kpis"),
+                "insight": slide.get("insight"),
+                "chart": _encode_chart_image(chart_path),
+            }
+        )
+        if isinstance(chart_path, str):
+            _safe_unlink(chart_path)
+
+    return payload
+
+
 @app.get("/health")
 def health() -> dict[str, Any]:
     return {
@@ -2814,6 +3142,43 @@ def update_daily_pulse_questions(
     raise HTTPException(status_code=500, detail="Failed to update daily pulse questions")
 
 
+@app.get("/api/v1/suggestions", response_model=list[SuggestionItem])
+@app.get("/suggestions", response_model=list[SuggestionItem])
+def get_suggestions(raw_request: Request, q: str = "") -> list[SuggestionItem]:
+    _get_request_user(raw_request)
+    query = (q or "").strip()
+    if len(query) < 3:
+        if len(query) == 2:
+            cached = _get_cached_suggestions(query)
+            return cached or []
+        return []
+
+    cached = _get_cached_suggestions(query)
+    if cached is not None:
+        return cached
+
+    prefix_matches = _prefix_search_snowflake(query, limit=5)
+    keyword_matches = _keyword_search_snowflake(query, limit=5)
+    semantic_matches = _semantic_search_snowflake(query, limit=5)
+
+    threshold = 0.55 if len(query) <= 5 else 0.65
+
+    semantic_filtered = [
+        item for item in semantic_matches if float(item.get("score") or 0.0) >= threshold
+    ]
+    merged = _merge_suggestions(
+        [
+            ("semantic", semantic_filtered),
+            ("keyword", keyword_matches),
+            ("prefix", prefix_matches),
+        ],
+        limit=5,
+    )
+    result = [SuggestionItem(**item) for item in merged]
+    _set_cached_suggestions(query, result)
+    return result
+
+
 def _run_chat_request(request: ChatRequest, user_id: str) -> ChatResponse:
     try:
         _register_thread_if_missing(request.thread_id, user_id)
@@ -2894,6 +3259,47 @@ def _run_chat_request(request: ChatRequest, user_id: str) -> ChatResponse:
             for line in parsed_sections["relevant_questions"].splitlines()
             if line.strip()
         ]
+
+    try:
+        cached_messages = _load_cached_messages(request.thread_id, user_id)
+        user_message = {
+            "id": str(uuid.uuid4()),
+            "role": "user",
+            "parts": [{"type": "text", "text": request.question}],
+        }
+        assistant_parts: list[dict[str, Any]] = [
+            {"type": "text", "text": assistant_text or "Completed"}
+        ]
+        if parsed_sections.get("result_summary"):
+            assistant_parts.append(
+                {"type": "data-resultSummary", "data": parsed_sections["result_summary"]}
+            )
+        if parsed_sections.get("sql_query"):
+            assistant_parts.append({"type": "data-sqlQuery", "data": parsed_sections["sql_query"]})
+        if isinstance(sql_result, dict):
+            assistant_parts.append({"type": "data-sqlResult", "data": sql_result})
+            columns = sql_result.get("columns")
+            if isinstance(columns, list) and columns:
+                assistant_parts.append({"type": "data-sqlColumns", "data": columns})
+            rows = sql_result.get("data")
+            if isinstance(rows, list):
+                assistant_parts.append({"type": "data-sqlRowCount", "data": len(rows)})
+        if visualization_code:
+            assistant_parts.append({"type": "data-visualizationCode", "data": visualization_code})
+        if isinstance(visualization_figure, dict):
+            assistant_parts.append({"type": "data-visualizationFigure", "data": visualization_figure})
+        if relevant_questions:
+            assistant_parts.append({"type": "data-relevantQuestions", "data": relevant_questions})
+
+        assistant_message = {
+            "id": str(uuid.uuid4()),
+            "role": "assistant",
+            "parts": assistant_parts,
+        }
+        cached_messages.extend([user_message, assistant_message])
+        _save_cached_messages(request.thread_id, user_id, cached_messages)
+    except Exception as exc:
+        logger.warning("Unable to cache non-stream chat for ppt: %s", exc)
 
     return ChatResponse(
         thread_id=request.thread_id,
@@ -3365,6 +3771,113 @@ async def chat_stream(request: ChatRequest, raw_request: Request) -> StreamingRe
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@app.post("/api/v1/pptx/slide")
+def create_slide_ppt(
+    request: PptGenerationRequest,
+    raw_request: Request,
+    background_tasks: BackgroundTasks,
+) -> FileResponse:
+    current_user = _get_request_user(raw_request)
+    current_user_id = current_user["user_id"]
+
+    if not _is_thread_visible(None, request.thread_id, current_user_id):
+        raise HTTPException(status_code=404, detail="Thread not found")
+
+    assistant_message_id = _normalize_optional_text(request.message_id)
+    if not assistant_message_id:
+        raise HTTPException(status_code=400, detail="message_id is required")
+
+    cached_messages = _load_thread_messages_for_ppt(request.thread_id, current_user_id)
+    if not cached_messages:
+        raise HTTPException(status_code=404, detail="No messages found for thread")
+
+    pair_messages = _select_user_assistant_pair(cached_messages, assistant_message_id)
+    langchain_messages = _build_langchain_messages_from_cached(pair_messages)
+    if not langchain_messages:
+        raise HTTPException(status_code=404, detail="No slide content available")
+
+    output_path = _build_temp_ppt_path()
+    _generate_ppt_file(langchain_messages, output_path)
+
+    chatbot_instance = _get_chatbot()
+    thread_title = _get_thread_title(chatbot_instance, request.thread_id, current_user_id)
+    filename = _build_ppt_filename(thread_title, "slide")
+    disposition = _normalize_disposition(request.disposition)
+
+    background_tasks.add_task(_safe_unlink, output_path)
+    return FileResponse(
+        output_path,
+        media_type=PPTX_MEDIA_TYPE,
+        headers={"Content-Disposition": f"{disposition}; filename=\"{filename}\""},
+    )
+
+
+@app.post("/api/v1/pptx/deck")
+def create_deck_ppt(
+    request: PptGenerationRequest,
+    raw_request: Request,
+    background_tasks: BackgroundTasks,
+) -> FileResponse:
+    current_user = _get_request_user(raw_request)
+    current_user_id = current_user["user_id"]
+
+    if not _is_thread_visible(None, request.thread_id, current_user_id):
+        raise HTTPException(status_code=404, detail="Thread not found")
+
+    cached_messages = _load_thread_messages_for_ppt(request.thread_id, current_user_id)
+    if not cached_messages:
+        raise HTTPException(status_code=404, detail="No messages found for thread")
+
+    langchain_messages = _build_langchain_messages_from_cached(cached_messages)
+    if not langchain_messages:
+        raise HTTPException(status_code=404, detail="No deck content available")
+
+    output_path = _build_temp_ppt_path()
+    _generate_ppt_file(langchain_messages, output_path)
+
+    chatbot_instance = _get_chatbot()
+    thread_title = _get_thread_title(chatbot_instance, request.thread_id, current_user_id)
+    filename = _build_ppt_filename(thread_title, "deck")
+    disposition = _normalize_disposition(request.disposition)
+
+    background_tasks.add_task(_safe_unlink, output_path)
+    return FileResponse(
+        output_path,
+        media_type=PPTX_MEDIA_TYPE,
+        headers={"Content-Disposition": f"{disposition}; filename=\"{filename}\""},
+    )
+
+
+@app.post("/api/v1/pptx/preview")
+def preview_ppt(
+    request: PptGenerationRequest,
+    raw_request: Request,
+) -> dict[str, Any]:
+    current_user = _get_request_user(raw_request)
+    current_user_id = current_user["user_id"]
+
+    if not _is_thread_visible(None, request.thread_id, current_user_id):
+        raise HTTPException(status_code=404, detail="Thread not found")
+
+    cached_messages = _load_thread_messages_for_ppt(request.thread_id, current_user_id)
+    if not cached_messages:
+        raise HTTPException(status_code=404, detail="No messages found for thread")
+
+    assistant_message_id = _normalize_optional_text(request.message_id)
+    if assistant_message_id:
+        cached_messages = _select_user_assistant_pair(cached_messages, assistant_message_id)
+
+    langchain_messages = _build_langchain_messages_from_cached(cached_messages)
+    if not langchain_messages:
+        raise HTTPException(status_code=404, detail="No preview content available")
+
+    slides = _build_preview_payload(langchain_messages)
+    if not slides:
+        raise HTTPException(status_code=404, detail="No preview content available")
+
+    return {"slides": slides}
 
 
 @app.get("/api/v1/history")
