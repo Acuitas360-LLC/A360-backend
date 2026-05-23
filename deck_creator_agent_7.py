@@ -107,13 +107,10 @@ def parse_conversation(messages):
                 code = kwargs.get("code")
                 figure = kwargs.get("figure")
 
-                # Handle NO_VISUALIZATION case
                 if code and code != "NO_VISUALIZATION":
                     current_block["viz_code"] = code
-                else:
-                    current_block["viz_code"] = None
-                    if isinstance(figure, dict):
-                        current_block["viz_figure"] = figure
+                if isinstance(figure, dict):
+                    current_block["viz_figure"] = figure
 
                 continue
 
@@ -402,7 +399,7 @@ def generate_chart(block):
 
             fig = local_vars.get("fig")
             if fig is None:
-                return None
+                raise ValueError("Visualization code did not create fig")
 
             try:
                 fig_json = fig.to_plotly_json() if hasattr(fig, "to_plotly_json") else None
@@ -411,7 +408,7 @@ def generate_chart(block):
 
             normalized = _normalize_plotly_figure(fig_json) if isinstance(fig_json, dict) else None
             if normalized is None:
-                return None
+                raise ValueError("Visualization figure normalization failed")
 
             fig = go.Figure(normalized)
             file_path = os.path.join(tempfile.gettempdir(), f"chart_{uuid.uuid4().hex}.png")
@@ -421,7 +418,7 @@ def generate_chart(block):
 
         except Exception as e:
             print("Chart error:", e)
-            return None
+            # Fall through to viz_figure if provided.
 
     if not isinstance(viz_figure, dict):
         return None

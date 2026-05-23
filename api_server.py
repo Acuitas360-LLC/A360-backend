@@ -1794,10 +1794,12 @@ def _build_heuristic_plotly_figure_json(
 
     fig.update_layout(
         barmode="group",
-        margin={"l": 40, "r": 20, "t": 24, "b": 80},
+        margin={"l": 20, "r": 20, "t": 24, "b": 60},
         xaxis={"title": str(category_column), "tickangle": -35},
         yaxis={"title": "Value"},
         template="plotly_white",
+        width=1200,
+        height=700,
     )
 
     try:
@@ -2800,7 +2802,11 @@ def _serialize_thread_messages(
                 if isinstance(raw_code, str):
                     _append_assistant_data_part({"type": "data-visualizationCode", "data": raw_code})
 
-                    figure_json = _build_plotly_figure_json(raw_code, _get_assistant_sql_result())
+                    sql_result = _get_assistant_sql_result()
+                    figure_json = _build_plotly_figure_json(raw_code, sql_result)
+                    if figure_json is None and isinstance(sql_result, dict):
+                        figure_json = _build_heuristic_plotly_figure_json(sql_result)
+
                     if isinstance(figure_json, dict) and figure_json.get("data"):
                         _append_assistant_data_part(
                             {"type": "data-visualizationFigure", "data": figure_json}
@@ -2902,42 +2908,9 @@ def _load_thread_messages_for_ppt(thread_id: str, user_id: str) -> list[dict[str
     return serialized
 
 
-def _select_latest_user_assistant_pair(
-    cached_messages: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    target_index: Optional[int] = None
-    for index in range(len(cached_messages) - 1, -1, -1):
-        message = cached_messages[index]
-        if not isinstance(message, dict):
-            continue
-        if str(message.get("role") or "").strip().lower() == "assistant":
-            target_index = index
-            break
-
-    if target_index is None:
-        raise HTTPException(status_code=404, detail="No assistant message found")
-
-    target_message = cached_messages[target_index]
-    user_message: Optional[dict[str, Any]] = None
-    for prior_index in range(target_index - 1, -1, -1):
-        prior = cached_messages[prior_index]
-        if not isinstance(prior, dict):
-            continue
-        if str(prior.get("role") or "").strip().lower() == "user":
-            user_message = prior
-            break
-
-    if user_message is None:
-        raise HTTPException(status_code=404, detail="No prior user message found for assistant")
-
-    return [user_message, target_message]
-
-
 def _select_user_assistant_pair(
     cached_messages: list[dict[str, Any]],
     assistant_message_id: str,
-    *,
-    fallback_to_latest: bool = False,
 ) -> list[dict[str, Any]]:
     target_index: Optional[int] = None
     for index, message in enumerate(cached_messages):
@@ -2948,8 +2921,6 @@ def _select_user_assistant_pair(
             break
 
     if target_index is None:
-        if fallback_to_latest:
-            return _select_latest_user_assistant_pair(cached_messages)
         raise HTTPException(status_code=404, detail="Assistant message not found")
 
     target_message = cached_messages[target_index]
@@ -3031,11 +3002,24 @@ def _encode_chart_image(chart_path: Optional[str]) -> Optional[str]:
 
 
 def _build_preview_payload(messages: list[Any]) -> list[dict[str, Any]]:
-    from deck_creator_agent_7 import build_slide_data
+    from deck_creator_agent_7 import build_slide_data, parse_conversation
 
+    blocks = parse_conversation(messages)
     slides = build_slide_data(messages)
     payload: list[dict[str, Any]] = []
-    for slide in slides:
+    for index, slide in enumerate(slides):
+        block = blocks[index] if index < len(blocks) else None
+        chart_fit: Optional[str] = None
+        if isinstance(block, dict) and isinstance(block.get("viz_figure"), dict):
+            figure = block.get("viz_figure")
+            meta = figure.get("meta") if isinstance(figure, dict) else None
+            meta_source = (
+                str(meta.get("source")).strip().lower()
+                if isinstance(meta, dict) and meta.get("source")
+                else ""
+            )
+            if meta_source == "heuristic" or not block.get("viz_code"):
+                chart_fit = "fill"
         chart_path = slide.get("chart_path") if isinstance(slide, dict) else None
         payload.append(
             {
@@ -3044,6 +3028,7 @@ def _build_preview_payload(messages: list[Any]) -> list[dict[str, Any]]:
                 "kpis": slide.get("kpis"),
                 "insight": slide.get("insight"),
                 "chart": _encode_chart_image(chart_path),
+                "chartFit": chart_fit,
             }
         )
         if isinstance(chart_path, str):
@@ -3374,6 +3359,8 @@ async def chat_stream(request: ChatRequest, raw_request: Request) -> StreamingRe
         final_visualization_spec: Optional[str] = None
         final_visualization_figure: Optional[dict[str, Any]] = None
         relevant_questions: list[str] = []
+        persisted_user_message_id: Optional[str] = None
+        persisted_assistant_message_id: Optional[str] = None
 
         async def _client_disconnected() -> bool:
             try:
@@ -3382,6 +3369,8 @@ async def chat_stream(request: ChatRequest, raw_request: Request) -> StreamingRe
                 return False
 
         def _persist_stream_messages(always: bool = False) -> None:
+            nonlocal persisted_user_message_id
+            nonlocal persisted_assistant_message_id
             has_materialized_content = any(
                 [
                     bool(final_summary_text.strip()),
@@ -3432,6 +3421,9 @@ async def chat_stream(request: ChatRequest, raw_request: Request) -> StreamingRe
                 "role": "assistant",
                 "parts": assistant_parts,
             }
+
+            persisted_user_message_id = user_message["id"]
+            persisted_assistant_message_id = assistant_message["id"]
 
             cached_messages.extend([user_message, assistant_message])
             _save_cached_messages(request.thread_id, current_user_id, cached_messages)
@@ -3763,6 +3755,15 @@ async def chat_stream(request: ChatRequest, raw_request: Request) -> StreamingRe
 
             _persist_stream_messages(always=True)
 
+            if persisted_assistant_message_id:
+                yield _sse_event(
+                    "message_ids",
+                    {
+                        "assistant_message_id": persisted_assistant_message_id,
+                        "user_message_id": persisted_user_message_id,
+                    },
+                )
+
             if await _client_disconnected():
                 return
 
@@ -3828,11 +3829,7 @@ def create_slide_ppt(
     if not cached_messages:
         raise HTTPException(status_code=404, detail="No messages found for thread")
 
-    pair_messages = _select_user_assistant_pair(
-        cached_messages,
-        assistant_message_id,
-        fallback_to_latest=True,
-    )
+    pair_messages = _select_user_assistant_pair(cached_messages, assistant_message_id)
     langchain_messages = _build_langchain_messages_from_cached(pair_messages)
     if not langchain_messages:
         raise HTTPException(status_code=404, detail="No slide content available")
@@ -3906,11 +3903,7 @@ def preview_ppt(
 
     assistant_message_id = _normalize_optional_text(request.message_id)
     if assistant_message_id:
-        cached_messages = _select_user_assistant_pair(
-            cached_messages,
-            assistant_message_id,
-            fallback_to_latest=True,
-        )
+        cached_messages = _select_user_assistant_pair(cached_messages, assistant_message_id)
 
     langchain_messages = _build_langchain_messages_from_cached(cached_messages)
     if not langchain_messages:
