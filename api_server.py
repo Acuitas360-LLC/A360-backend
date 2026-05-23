@@ -2986,7 +2986,19 @@ def _generate_ppt_file(messages: list[Any], output_path: str) -> str:
     if logo_path:
         kwargs["logo_path"] = logo_path
 
-    return build_ppt(messages, **kwargs)
+    print(
+        "[PPT] api: generate start "
+        f"messages={len(messages)} output={output_path} "
+        f"template={template_path} logo={logo_path}"
+    )
+    try:
+        result = build_ppt(messages, **kwargs)
+    except Exception:
+        print(f"[PPT] api: generate error output={output_path}")
+        raise
+
+    print(f"[PPT] api: generate done output={output_path}")
+    return result
 
 
 def _encode_chart_image(chart_path: Optional[str]) -> Optional[str]:
@@ -2998,12 +3010,14 @@ def _encode_chart_image(chart_path: Optional[str]) -> Optional[str]:
             encoded = base64.b64encode(handle.read()).decode("ascii")
         return f"data:image/png;base64,{encoded}"
     except Exception:
+        print(f"[PPT] preview: chart encode error path={chart_path}")
         return None
 
 
 def _build_preview_payload(messages: list[Any]) -> list[dict[str, Any]]:
     from deck_creator_agent_7 import build_slide_data, parse_conversation
 
+    print(f"[PPT] preview: build start messages={len(messages)}")
     blocks = parse_conversation(messages)
     slides = build_slide_data(messages)
     payload: list[dict[str, Any]] = []
@@ -3034,6 +3048,7 @@ def _build_preview_payload(messages: list[Any]) -> list[dict[str, Any]]:
         if isinstance(chart_path, str):
             _safe_unlink(chart_path)
 
+    print(f"[PPT] preview: build done slides={len(payload)}")
     return payload
 
 
@@ -3167,10 +3182,7 @@ def update_daily_pulse_questions(
 def get_suggestions(raw_request: Request, q: str = "") -> list[SuggestionItem]:
     _get_request_user(raw_request)
     query = (q or "").strip()
-    if len(query) < 3:
-        if len(query) == 2:
-            cached = _get_cached_suggestions(query)
-            return cached or []
+    if len(query) < 2:
         return []
 
     cached = _get_cached_suggestions(query)
@@ -3179,13 +3191,15 @@ def get_suggestions(raw_request: Request, q: str = "") -> list[SuggestionItem]:
 
     prefix_matches = _prefix_search_snowflake(query, limit=5)
     keyword_matches = _keyword_search_snowflake(query, limit=5)
-    semantic_matches = _semantic_search_snowflake(query, limit=5)
-
-    threshold = 0.55 if len(query) <= 5 else 0.65
-
-    semantic_filtered = [
-        item for item in semantic_matches if float(item.get("score") or 0.0) >= threshold
-    ]
+    semantic_filtered: list[dict[str, Any]] = []
+    if len(query) >= 3:
+        semantic_matches = _semantic_search_snowflake(query, limit=5)
+        threshold = 0.55 if len(query) <= 5 else 0.65
+        semantic_filtered = [
+            item
+            for item in semantic_matches
+            if float(item.get("score") or 0.0) >= threshold
+        ]
     merged = _merge_suggestions(
         [
             ("semantic", semantic_filtered),
@@ -3818,6 +3832,11 @@ def create_slide_ppt(
     current_user = _get_request_user(raw_request)
     current_user_id = current_user["user_id"]
 
+    print(
+        "[PPT] api: slide request "
+        f"thread={request.thread_id} message={request.message_id} user={current_user_id}"
+    )
+
     if not _is_thread_visible(None, request.thread_id, current_user_id):
         raise HTTPException(status_code=404, detail="Thread not found")
 
@@ -3843,6 +3862,7 @@ def create_slide_ppt(
     disposition = _normalize_disposition(request.disposition)
 
     background_tasks.add_task(_safe_unlink, output_path)
+    print(f"[PPT] api: slide response ready thread={request.thread_id} output={output_path}")
     return FileResponse(
         output_path,
         media_type=PPTX_MEDIA_TYPE,
@@ -3858,6 +3878,11 @@ def create_deck_ppt(
 ) -> FileResponse:
     current_user = _get_request_user(raw_request)
     current_user_id = current_user["user_id"]
+
+    print(
+        "[PPT] api: deck request "
+        f"thread={request.thread_id} user={current_user_id}"
+    )
 
     if not _is_thread_visible(None, request.thread_id, current_user_id):
         raise HTTPException(status_code=404, detail="Thread not found")
@@ -3879,6 +3904,7 @@ def create_deck_ppt(
     disposition = _normalize_disposition(request.disposition)
 
     background_tasks.add_task(_safe_unlink, output_path)
+    print(f"[PPT] api: deck response ready thread={request.thread_id} output={output_path}")
     return FileResponse(
         output_path,
         media_type=PPTX_MEDIA_TYPE,
@@ -3893,6 +3919,11 @@ def preview_ppt(
 ) -> dict[str, Any]:
     current_user = _get_request_user(raw_request)
     current_user_id = current_user["user_id"]
+
+    print(
+        "[PPT] api: preview request "
+        f"thread={request.thread_id} message={request.message_id} user={current_user_id}"
+    )
 
     if not _is_thread_visible(None, request.thread_id, current_user_id):
         raise HTTPException(status_code=404, detail="Thread not found")
@@ -3913,6 +3944,7 @@ def preview_ppt(
     if not slides:
         raise HTTPException(status_code=404, detail="No preview content available")
 
+    print(f"[PPT] api: preview response ready thread={request.thread_id} slides={len(slides)}")
     return {"slides": slides}
 
 
