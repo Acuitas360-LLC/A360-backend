@@ -14,5 +14,6 @@ uvicorn
 gunicorn
 pandas
 plotly
+kaleido
 PyJWT
 python-pptx
