@@ -455,13 +455,17 @@ def enrich_with_chart(slide):
     return slide  
 
 
-def build_slide_data(messages):
+def build_slide_data(messages, chart_path_overrides: list[str] | None = None):
     blocks = parse_conversation(messages)
     print(f"[PPT] slides: building (blocks={len(blocks)})")
     slides = []
-    for block in blocks:
+    for index, block in enumerate(blocks):
         slide = build_slide_object(block)
-        slide = enrich_with_chart(slide)
+        if isinstance(chart_path_overrides, list):
+            override = chart_path_overrides[index] if index < len(chart_path_overrides) else None
+            slide["chart_path"] = override
+        else:
+            slide = enrich_with_chart(slide)
         slides.append(slide)
     print(f"[PPT] slides: built (slides={len(slides)})")
     return slides
@@ -1067,6 +1071,7 @@ def build_ppt(
     output_path: str = "final_presentation.pptx",
     uploaded_pptx_path: str | None = "Geron.pptx",
     logo_path: str | None = "Geron_Logo.png",
+    chart_path_overrides: list[str] | None = None,
 ) -> str:
     resolved_template = (
         uploaded_pptx_path
@@ -1082,7 +1087,7 @@ def build_ppt(
         f"output={output_path} template={resolved_template or ''} logo={resolved_logo or ''}"
     )
  
-    slides = build_slide_data(messages)
+    slides = build_slide_data(messages, chart_path_overrides=chart_path_overrides)
  
     prs = None
     for slide in slides:

@@ -87,6 +87,8 @@ class PptGenerationRequest(BaseModel):
     thread_id: str = Field(..., min_length=1)
     message_id: Optional[str] = None
     disposition: Optional[str] = None
+    chart_image_base64: Optional[str] = None
+    chart_images_base64: Optional[list[str]] = None
 
 
 class DailyPulseUpdateRequest(BaseModel):
@@ -2967,6 +2969,56 @@ def _build_temp_ppt_path() -> str:
     return os.path.join(tempfile.gettempdir(), f"ppt_{uuid.uuid4().hex}.pptx")
 
 
+def _decode_chart_image_base64(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+
+    raw = value.strip()
+    if not raw:
+        return None
+
+    if raw.startswith("data:"):
+        try:
+            _, raw = raw.split(",", 1)
+        except ValueError:
+            return None
+
+    try:
+        decoded = base64.b64decode(raw)
+    except Exception:
+        return None
+
+    file_path = os.path.join(tempfile.gettempdir(), f"chart_upload_{uuid.uuid4().hex}.png")
+    try:
+        with open(file_path, "wb") as handle:
+            handle.write(decoded)
+    except Exception:
+        return None
+
+    return file_path
+
+
+def _decode_chart_images_base64(values: Optional[list[str]]) -> Optional[list[Optional[str]]]:
+    if values is None:
+        return None
+
+    if not isinstance(values, list):
+        return None
+
+    if not values:
+        return []
+
+    decoded_paths: list[Optional[str]] = []
+    for value in values:
+        if not value:
+            decoded_paths.append(None)
+            continue
+
+        decoded_paths.append(_decode_chart_image_base64(value))
+
+    return decoded_paths
+
+
 def _safe_unlink(path: str) -> None:
     try:
         if path and os.path.exists(path):
@@ -2975,7 +3027,11 @@ def _safe_unlink(path: str) -> None:
         pass
 
 
-def _generate_ppt_file(messages: list[Any], output_path: str) -> str:
+def _generate_ppt_file(
+    messages: list[Any],
+    output_path: str,
+    chart_path_overrides: Optional[list[Optional[str]]] = None,
+) -> str:
     from deck_creator_agent_7 import build_ppt
 
     template_path = os.getenv("PPT_TEMPLATE_PATH", "").strip()
@@ -2985,6 +3041,8 @@ def _generate_ppt_file(messages: list[Any], output_path: str) -> str:
         kwargs["uploaded_pptx_path"] = template_path
     if logo_path:
         kwargs["logo_path"] = logo_path
+    if chart_path_overrides:
+        kwargs["chart_path_overrides"] = chart_path_overrides
 
     print(
         "[PPT] api: generate start "
@@ -3014,12 +3072,15 @@ def _encode_chart_image(chart_path: Optional[str]) -> Optional[str]:
         return None
 
 
-def _build_preview_payload(messages: list[Any]) -> list[dict[str, Any]]:
+def _build_preview_payload(
+    messages: list[Any],
+    chart_path_overrides: Optional[list[Optional[str]]] = None,
+) -> list[dict[str, Any]]:
     from deck_creator_agent_7 import build_slide_data, parse_conversation
 
     print(f"[PPT] preview: build start messages={len(messages)}")
     blocks = parse_conversation(messages)
-    slides = build_slide_data(messages)
+    slides = build_slide_data(messages, chart_path_overrides=chart_path_overrides)
     payload: list[dict[str, Any]] = []
     for index, slide in enumerate(slides):
         block = blocks[index] if index < len(blocks) else None
@@ -3853,8 +3914,13 @@ def create_slide_ppt(
     if not langchain_messages:
         raise HTTPException(status_code=404, detail="No slide content available")
 
+    chart_overrides = _decode_chart_images_base64(request.chart_images_base64)
+    if chart_overrides is None:
+        chart_override_path = _decode_chart_image_base64(request.chart_image_base64)
+        chart_overrides = [chart_override_path] if chart_override_path else None
+
     output_path = _build_temp_ppt_path()
-    _generate_ppt_file(langchain_messages, output_path)
+    _generate_ppt_file(langchain_messages, output_path, chart_path_overrides=chart_overrides)
 
     chatbot_instance = _get_chatbot()
     thread_title = _get_thread_title(chatbot_instance, request.thread_id, current_user_id)
@@ -3895,8 +3961,13 @@ def create_deck_ppt(
     if not langchain_messages:
         raise HTTPException(status_code=404, detail="No deck content available")
 
+    chart_overrides = _decode_chart_images_base64(request.chart_images_base64)
+    if chart_overrides is None:
+        chart_override_path = _decode_chart_image_base64(request.chart_image_base64)
+        chart_overrides = [chart_override_path] if chart_override_path else None
+
     output_path = _build_temp_ppt_path()
-    _generate_ppt_file(langchain_messages, output_path)
+    _generate_ppt_file(langchain_messages, output_path, chart_path_overrides=chart_overrides)
 
     chatbot_instance = _get_chatbot()
     thread_title = _get_thread_title(chatbot_instance, request.thread_id, current_user_id)
@@ -3940,7 +4011,12 @@ def preview_ppt(
     if not langchain_messages:
         raise HTTPException(status_code=404, detail="No preview content available")
 
-    slides = _build_preview_payload(langchain_messages)
+    chart_overrides = _decode_chart_images_base64(request.chart_images_base64)
+    if chart_overrides is None:
+        chart_override_path = _decode_chart_image_base64(request.chart_image_base64)
+        chart_overrides = [chart_override_path] if chart_override_path else None
+
+    slides = _build_preview_payload(langchain_messages, chart_path_overrides=chart_overrides)
     if not slides:
         raise HTTPException(status_code=404, detail="No preview content available")
 
