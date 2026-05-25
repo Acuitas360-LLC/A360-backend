@@ -16,3 +16,4 @@ pandas
 plotly
 PyJWT
 python-pptx
+rank-bm25

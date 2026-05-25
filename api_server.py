@@ -19,6 +19,8 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Optional
 import jwt
 from jwt import PyJWKClient
+from rank_bm25 import BM25Okapi
+from nltk.stem import PorterStemmer
 import psycopg
 from psycopg_pool import ConnectionPool, PoolTimeout
 
@@ -922,6 +924,10 @@ async def _startup_db_warmup() -> None:
     db_retry_task_running = True
     db_retry_task = asyncio.create_task(_db_retry_loop(), name="db-retry-loop")
     _log_db_event("db.startup_retry_started", warmup_enabled=DB_WARMUP_ON_STARTUP)
+    try:
+        await asyncio.to_thread(initialize_bm25_index)
+    except Exception as exc:
+        logger.warning("BM25 index initialization failed during startup: %s", exc)
 
 
 async def _db_retry_loop() -> None:
@@ -1227,10 +1233,59 @@ SUGGESTION_CACHE_TTL_SECONDS = int(os.getenv("SUGGESTION_CACHE_TTL_SECONDS", "12
 SUGGESTION_CACHE_MAX_ITEMS = int(os.getenv("SUGGESTION_CACHE_MAX_ITEMS", "200"))
 _suggestion_cache: "OrderedDict[str, tuple[float, list[SuggestionItem]]]" = OrderedDict()
 _suggestion_cache_lock = threading.Lock()
+_bm25_index: Optional[BM25Okapi] = None
+_bm25_questions: list[str] = []
+_bm25_question_tokens: list[list[str]] = []
+_bm25_lock = threading.Lock()
 
 
 def _suggestion_cache_key(query: str) -> str:
     return _normalize_suggestion_text(query)
+
+
+_stemmer = PorterStemmer()
+
+def _tokenize_bm25(text: str) -> list[str]:
+    tokens = re.findall(r"[a-z0-9]+", text.lower())
+    return [_stemmer.stem(token) for token in tokens]
+
+
+def _tokenize_prefix(text: str) -> list[str]:
+    return re.findall(r"[a-z0-9]+", text.lower())
+
+
+def initialize_bm25_index() -> None:
+    global _bm25_index
+    global _bm25_questions
+
+    with _bm25_lock:
+        if _bm25_index is not None:
+            return
+
+    from chatbot8 import run_snowflake_query
+
+    logger.info("BM25 index initialization started")
+    try:
+        df = run_snowflake_query(
+            "SELECT DISTINCT question FROM rag_payload WHERE question IS NOT NULL"
+        )
+    except Exception as exc:
+        logger.warning("BM25 index initialization failed: %s", exc)
+        return
+
+    questions: list[str] = []
+    for _, row in df.iterrows():
+        question = str(row.get("QUESTION") or row.get("question") or "").strip()
+        if question:
+            questions.append(question)
+
+    tokenized = [_tokenize_bm25(question) for question in questions]
+    question_tokens = [_tokenize_prefix(question) for question in questions]
+    with _bm25_lock:
+        _bm25_questions = questions
+        _bm25_question_tokens = question_tokens
+        _bm25_index = BM25Okapi(tokenized) if questions else None
+        logger.info("BM25 index initialized (questions=%d)", len(_bm25_questions))
 
 
 def _get_cached_suggestions(query: str) -> Optional[list[SuggestionItem]]:
@@ -1257,87 +1312,68 @@ def _set_cached_suggestions(query: str, items: list[SuggestionItem]) -> None:
             _suggestion_cache.popitem(last=False)
 
 
-def _prefix_search_snowflake(query: str, limit: int = 5) -> list[dict[str, Any]]:
-    if not query:
+def _prefix_search_local(query: str, limit: int = 5) -> list[dict[str, Any]]:
+    query_tokens = [token for token in _tokenize_prefix(query) if len(token) >= 2]
+    if not query_tokens:
         return []
-    from chatbot8 import run_snowflake_query
 
-    safe_query = query.replace("'", "''")
-    sql = f"""
-    SELECT question
-    FROM rag_payload
-    WHERE LOWER(question) LIKE LOWER('{safe_query}%')
-    ORDER BY question
-    LIMIT {max(1, limit)}
-    """
-    try:
-        df = run_snowflake_query(sql)
-    except Exception as exc:
-        logger.warning("Prefix suggestion query failed: %s", exc)
+    with _bm25_lock:
+        questions = list(_bm25_questions)
+        question_tokens = list(_bm25_question_tokens)
+
+    if not questions or not question_tokens:
         return []
 
     results: list[dict[str, Any]] = []
-    for _, row in df.iterrows():
-        question = str(row.get("QUESTION") or row.get("question") or "").strip()
-        if question:
-            results.append({"question": question, "score": 0.35})
-    return results
+    for index, tokens in enumerate(question_tokens):
+        if not tokens:
+            continue
+        score = 0.0
+        for query_token in query_tokens:
+            for token in tokens:
+                if token.startswith(query_token):
+                    score += len(query_token) / max(len(token), 1)
+                    break
+        if score > 0:
+            results.append({"question": questions[index], "score": score})
+
+    ranked = sorted(
+        results,
+        key=lambda item: (-float(item.get("score") or 0.0), item.get("question") or ""),
+    )
+    return ranked[: max(1, limit)]
 
 
-def _extract_suggestion_tokens(query: str) -> list[str]:
-    tokens = re.findall(r"[a-z0-9]+", query.lower())
-    return [token for token in tokens if len(token) >= 3]
-
-
-def _keyword_search_snowflake(query: str, limit: int = 5) -> list[dict[str, Any]]:
-    if not query:
-        return []
-    tokens = _extract_suggestion_tokens(query)
+def _bm25_search(query: str, limit: int = 5) -> list[dict[str, Any]]:
+    tokens = _tokenize_bm25(query)
     if not tokens:
         return []
-    from chatbot8 import run_snowflake_query
 
-    like_clauses: list[str] = []
-    for token in tokens:
-        safe_token = token.replace("'", "''")
-        like_clauses.append(f"LOWER(question) LIKE '%{safe_token}%'")
+    with _bm25_lock:
+        index = _bm25_index
+        questions = list(_bm25_questions)
 
-    sql = f"""
-    SELECT question
-    FROM rag_payload
-    WHERE {" OR ".join(like_clauses)}
-    ORDER BY question
-    LIMIT {max(1, limit)}
-    """
-    try:
-        df = run_snowflake_query(sql)
-    except Exception as exc:
-        logger.warning("Keyword suggestion query failed: %s", exc)
+    if index is None or not questions:
         return []
 
-    results: list[dict[str, Any]] = []
-    for _, row in df.iterrows():
-        question = str(row.get("QUESTION") or row.get("question") or "").strip()
-        if question:
-            results.append({"question": question, "score": 0.55})
-    return results
-
-
-def _semantic_search_snowflake(query: str, limit: int = 5) -> list[dict[str, Any]]:
-    from chatbot8 import search_snowflake
-
-    try:
-        raw_results = search_snowflake(user_query=query, intent=query, top_k=limit)
-    except Exception as exc:
-        logger.warning("Semantic suggestion search failed: %s", exc)
+    scores = index.get_scores(tokens)
+    if len(scores) == 0:
         return []
 
+    ranked_indices = sorted(
+        range(len(scores)),
+        key=lambda idx: scores[idx],
+        reverse=True,
+    )
+
     results: list[dict[str, Any]] = []
-    for row in raw_results:
-        question = str(row.get("matched_question") or "").strip()
-        score = float(row.get("score") or 0.0)
-        if question:
-            results.append({"question": question, "score": score})
+    for idx in ranked_indices:
+        score = float(scores[idx])
+        if score <= 0:
+            continue
+        results.append({"question": questions[idx], "score": score})
+        if len(results) >= max(1, limit):
+            break
     return results
 
 
@@ -1345,7 +1381,7 @@ def _merge_suggestions(
     sources: list[tuple[str, list[dict[str, Any]]]],
     limit: int = 5,
 ) -> list[dict[str, Any]]:
-    priority = {"semantic": 0, "keyword": 1, "prefix": 2}
+    priority = {"prefix": 0, "bm25": 1}
     merged: dict[str, dict[str, Any]] = {}
     for source_name, source in sources:
         source_priority = priority.get(source_name, 99)
@@ -3242,35 +3278,53 @@ def update_daily_pulse_questions(
 @app.get("/suggestions", response_model=list[SuggestionItem])
 def get_suggestions(raw_request: Request, q: str = "") -> list[SuggestionItem]:
     _get_request_user(raw_request)
+    start_time = time.perf_counter()
     query = (q or "").strip()
     if len(query) < 2:
+        logger.info(
+            "Suggestions latency %.2fms (short query)",
+            (time.perf_counter() - start_time) * 1000,
+        )
         return []
 
+    cache_start = time.perf_counter()
     cached = _get_cached_suggestions(query)
     if cached is not None:
+        logger.info(
+            "Suggestions cache hit (%.2fms)",
+            (time.perf_counter() - cache_start) * 1000,
+        )
+        logger.info(
+            "Suggestions latency %.2fms (cache hit)",
+            (time.perf_counter() - start_time) * 1000,
+        )
         return cached
+    logger.info(
+        "Suggestions cache miss (%.2fms)",
+        (time.perf_counter() - cache_start) * 1000,
+    )
 
-    prefix_matches = _prefix_search_snowflake(query, limit=5)
-    keyword_matches = _keyword_search_snowflake(query, limit=5)
-    semantic_filtered: list[dict[str, Any]] = []
-    if len(query) >= 3:
-        semantic_matches = _semantic_search_snowflake(query, limit=5)
-        threshold = 0.55 if len(query) <= 5 else 0.65
-        semantic_filtered = [
-            item
-            for item in semantic_matches
-            if float(item.get("score") or 0.0) >= threshold
-        ]
+    prefix_matches = _prefix_search_local(query, limit=5)
+    bm25_start = time.perf_counter()
+    bm25_matches = _bm25_search(query, limit=5)
+    bm25_ms = (time.perf_counter() - bm25_start) * 1000
+    merge_start = time.perf_counter()
     merged = _merge_suggestions(
         [
-            ("semantic", semantic_filtered),
-            ("keyword", keyword_matches),
             ("prefix", prefix_matches),
+            ("bm25", bm25_matches),
         ],
         limit=5,
     )
+    merge_ms = (time.perf_counter() - merge_start) * 1000
     result = [SuggestionItem(**item) for item in merged]
     _set_cached_suggestions(query, result)
+    logger.info(
+        "Suggestions latency %.2fms (bm25 %.2fms, merge %.2fms)",
+        (time.perf_counter() - start_time) * 1000,
+        bm25_ms,
+        merge_ms,
+    )
     return result
 
 
