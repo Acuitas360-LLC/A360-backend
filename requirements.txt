@@ -18,3 +18,4 @@ PyJWT
 python-pptx
 rank-bm25
 nltk
+rapidfuzz

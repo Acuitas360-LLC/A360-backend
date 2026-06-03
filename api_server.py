@@ -16,7 +16,7 @@ from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from importlib import import_module
 from datetime import UTC, datetime, timedelta
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 import jwt
 from jwt import PyJWKClient
 from rank_bm25 import BM25Okapi
@@ -91,6 +91,11 @@ class PptGenerationRequest(BaseModel):
     disposition: Optional[str] = None
     chart_image_base64: Optional[str] = None
     chart_images_base64: Optional[list[str]] = None
+    request_id: Optional[str] = None
+
+
+class PptCancelRequest(BaseModel):
+    request_id: str = Field(..., min_length=1)
 
 
 class DailyPulseUpdateRequest(BaseModel):
@@ -125,6 +130,53 @@ DB_WARMUP_ON_STARTUP = os.getenv("DB_WARMUP_ON_STARTUP", "0").strip().lower() in
 
 class DatabaseUnavailableError(RuntimeError):
     pass
+
+
+class PptCancelledError(RuntimeError):
+    pass
+
+
+_ppt_cancel_lock = threading.Lock()
+_ppt_cancel_events: dict[str, threading.Event] = {}
+
+
+def _register_ppt_cancel_event(request_id: Optional[str]) -> None:
+    if not request_id:
+        return
+
+    with _ppt_cancel_lock:
+        if request_id not in _ppt_cancel_events:
+            _ppt_cancel_events[request_id] = threading.Event()
+
+
+def _clear_ppt_cancel_event(request_id: Optional[str]) -> None:
+    if not request_id:
+        return
+
+    with _ppt_cancel_lock:
+        _ppt_cancel_events.pop(request_id, None)
+
+
+def _cancel_ppt_request(request_id: str) -> bool:
+    with _ppt_cancel_lock:
+        event = _ppt_cancel_events.get(request_id)
+
+    if not event:
+        return False
+
+    event.set()
+    return True
+
+
+def _raise_if_ppt_cancelled(request_id: Optional[str]) -> None:
+    if not request_id:
+        return
+
+    with _ppt_cancel_lock:
+        event = _ppt_cancel_events.get(request_id)
+
+    if event and event.is_set():
+        raise PptCancelledError()
 
 
 @app.exception_handler(DatabaseUnavailableError)
@@ -1212,17 +1264,31 @@ chatbot = None
 stream_subgraph = None
 
 
-def _build_rag_examples_for_question(question: str) -> tuple[str, str, list[str]]:
-    from chatbot8 import build_rag_examples, get_intent_summary
+def _build_rag_examples_for_question(question: str) -> tuple[str, str, list[str], str]:
+    from chatbot8 import build_rag_examples, get_intent_summary, process_user_query
 
-    intent = question
+    corrected_question = process_user_query(question)
+    if not isinstance(corrected_question, str) or not corrected_question.strip():
+        corrected_question = question
+    print("Corrected Query")
+    print(corrected_question)
+
+    intent = corrected_question
     try:
-        intent = str(get_intent_summary(question)).strip() or question
+        intent = str(get_intent_summary(corrected_question)).strip() or corrected_question
     except Exception as exc:
         # Keep stream path resilient if intent extraction fails transiently.
         logger.warning("Intent extraction failed for RAG examples: %s", exc)
 
-    return build_rag_examples(question, intent)
+    sql_generator_rag_examples_text, query_decomposer_rag_examples_text, relevant_questions = (
+        build_rag_examples(corrected_question, intent)
+    )
+    return (
+        sql_generator_rag_examples_text,
+        query_decomposer_rag_examples_text,
+        relevant_questions,
+        corrected_question,
+    )
 
 
 def _normalize_suggestion_text(text: str) -> str:
@@ -1664,6 +1730,9 @@ def _build_plotly_figure_json(
     df = pd.DataFrame(rows)
 
     allowed_imports = {
+        "collections": "collections",
+        "datetime": "datetime",
+        "itertools": "itertools",
         "math": "math",
         "numpy": "numpy",
         "pandas": "pandas",
@@ -1671,6 +1740,9 @@ def _build_plotly_figure_json(
         "plotly.express": "plotly.express",
         "plotly.graph_objects": "plotly.graph_objects",
         "plotly.subplots": "plotly.subplots",
+        "re": "re",
+        "statistics": "statistics",
+        "time": "time",
     }
 
     def safe_import(name: str, globals: Any = None, locals: Any = None, fromlist: Any = (), level: int = 0):
@@ -1697,6 +1769,31 @@ def _build_plotly_figure_json(
         "sum": sum,
         "tuple": tuple,
         "zip": zip,
+        "all": all,
+        "any": any,
+        "bool": bool,
+        "filter": filter,
+        "map": map,
+        "next": next,
+        "iter": iter,
+        "reversed": reversed,
+        "pow": pow,
+        "slice": slice,
+        "frozenset": frozenset,
+        "isinstance": isinstance,
+        "issubclass": issubclass,
+        "getattr": getattr,
+        "setattr": setattr,
+        "hasattr": hasattr,
+        "repr": repr,
+        "format": format,
+        "Exception": Exception,
+        "ValueError": ValueError,
+        "TypeError": TypeError,
+        "KeyError": KeyError,
+        "IndexError": IndexError,
+        "AttributeError": AttributeError,
+        "RuntimeError": RuntimeError,
         "__import__": safe_import,
     }
     safe_globals: dict[str, Any] = {
@@ -2842,8 +2939,8 @@ def _serialize_thread_messages(
 
                     sql_result = _get_assistant_sql_result()
                     figure_json = _build_plotly_figure_json(raw_code, sql_result)
-                    if figure_json is None and isinstance(sql_result, dict):
-                        figure_json = _build_heuristic_plotly_figure_json(sql_result)
+                    # if figure_json is None and isinstance(sql_result, dict):
+                    #     figure_json = _build_heuristic_plotly_figure_json(sql_result)
 
                     if isinstance(figure_json, dict) and figure_json.get("data"):
                         _append_assistant_data_part(
@@ -3067,6 +3164,7 @@ def _generate_ppt_file(
     messages: list[Any],
     output_path: str,
     chart_path_overrides: Optional[list[Optional[str]]] = None,
+    cancel_check: Optional[Callable[[], None]] = None,
 ) -> str:
     from deck_creator_agent_7 import build_ppt
 
@@ -3079,6 +3177,8 @@ def _generate_ppt_file(
         kwargs["logo_path"] = logo_path
     if chart_path_overrides:
         kwargs["chart_path_overrides"] = chart_path_overrides
+    if cancel_check:
+        kwargs["cancel_check"] = cancel_check
 
     print(
         "[PPT] api: generate start "
@@ -3111,14 +3211,21 @@ def _encode_chart_image(chart_path: Optional[str]) -> Optional[str]:
 def _build_preview_payload(
     messages: list[Any],
     chart_path_overrides: Optional[list[Optional[str]]] = None,
+    cancel_check: Optional[Callable[[], None]] = None,
 ) -> list[dict[str, Any]]:
     from deck_creator_agent_7 import build_slide_data, parse_conversation
 
     print(f"[PPT] preview: build start messages={len(messages)}")
     blocks = parse_conversation(messages)
-    slides = build_slide_data(messages, chart_path_overrides=chart_path_overrides)
+    slides = build_slide_data(
+        messages,
+        chart_path_overrides=chart_path_overrides,
+        cancel_check=cancel_check,
+    )
     payload: list[dict[str, Any]] = []
     for index, slide in enumerate(slides):
+        if cancel_check:
+            cancel_check()
         block = blocks[index] if index < len(blocks) else None
         chart_fit: Optional[str] = None
         if isinstance(block, dict) and isinstance(block.get("viz_figure"), dict):
@@ -3398,8 +3505,8 @@ def _run_chat_request(request: ChatRequest, user_id: str) -> ChatResponse:
     assistant_text = assistant_text or "Completed"
     parsed_sections = _parse_agent_output(assistant_text)
     visualization_figure = _build_plotly_figure_json(visualization_code, sql_result)
-    if visualization_figure is None:
-        visualization_figure = _build_heuristic_plotly_figure_json(sql_result)
+    # if visualization_figure is None:
+    #     visualization_figure = _build_heuristic_plotly_figure_json(sql_result)
 
     relevant_questions: Optional[list[str]] = None
     if parsed_sections["relevant_questions"]:
@@ -3490,6 +3597,7 @@ async def chat_stream(request: ChatRequest, raw_request: Request) -> StreamingRe
         relevant_questions: list[str] = []
         persisted_user_message_id: Optional[str] = None
         persisted_assistant_message_id: Optional[str] = None
+        corrected_question = request.question
 
         async def _client_disconnected() -> bool:
             try:
@@ -3518,7 +3626,8 @@ async def chat_stream(request: ChatRequest, raw_request: Request) -> StreamingRe
             user_message = {
                 "id": str(uuid.uuid4()),
                 "role": "user",
-                "parts": [{"type": "text", "text": request.question}],
+                "parts": [{"type": "text", "text": corrected_question}],
+                # corrected_question
             }
             assistant_parts: list[dict[str, Any]] = [
                 {
@@ -3577,9 +3686,12 @@ async def chat_stream(request: ChatRequest, raw_request: Request) -> StreamingRe
             _register_thread_if_missing(request.thread_id, current_user_id)
             _set_thread_title_if_missing(request.thread_id, current_user_id, request.question)
 
-            sql_generator_rag_examples_text, query_decomposer_rag_examples_text, relevant_questions = (
-                await asyncio.to_thread(_build_rag_examples_for_question, request.question)
-            )
+            (
+                sql_generator_rag_examples_text,
+                query_decomposer_rag_examples_text,
+                relevant_questions,
+                corrected_question,
+            ) = await asyncio.to_thread(_build_rag_examples_for_question, request.question)
 
             yield _sse_event(
                 "status",
@@ -3600,7 +3712,7 @@ async def chat_stream(request: ChatRequest, raw_request: Request) -> StreamingRe
                 request.thread_id,
                 current_user_id,
             )
-            stream_messages = _seed_stream_messages(prior_messages, request.question)
+            stream_messages = _seed_stream_messages(prior_messages, corrected_question)
             logger.info(
                 "stream_context thread_id=%s prior_messages=%s seeded_messages=%s",
                 request.thread_id,
@@ -3609,7 +3721,7 @@ async def chat_stream(request: ChatRequest, raw_request: Request) -> StreamingRe
             )
 
             initial_state: dict[str, Any] = {
-                "question": request.question,
+                "question": corrected_question,
                 "messages": stream_messages,
                 "run_id": datetime.now(UTC).isoformat() + "Z",
                 "last_output": "",
@@ -3759,11 +3871,11 @@ async def chat_stream(request: ChatRequest, raw_request: Request) -> StreamingRe
                                 visualization_code,
                                 sql_result,
                             )
-                        if visualization_figure is None and isinstance(sql_result, dict):
-                            visualization_figure = await asyncio.to_thread(
-                                _build_heuristic_plotly_figure_json,
-                                sql_result,
-                            )
+                        # if visualization_figure is None and isinstance(sql_result, dict):
+                        #     visualization_figure = await asyncio.to_thread(
+                        #         _build_heuristic_plotly_figure_json,
+                        #         sql_result,
+                        #     )
 
                         if any(
                             [
@@ -3834,11 +3946,11 @@ async def chat_stream(request: ChatRequest, raw_request: Request) -> StreamingRe
                         visualization_code,
                         sql_result,
                     )
-                if visualization_figure is None and isinstance(sql_result, dict):
-                    visualization_figure = await asyncio.to_thread(
-                        _build_heuristic_plotly_figure_json,
-                        sql_result,
-                    )
+                # if visualization_figure is None and isinstance(sql_result, dict):
+                #     visualization_figure = await asyncio.to_thread(
+                #         _build_heuristic_plotly_figure_json,
+                #         sql_result,
+                #     )
 
                 if any(
                     [
@@ -3946,6 +4058,9 @@ def create_slide_ppt(
 ) -> FileResponse:
     current_user = _get_request_user(raw_request)
     current_user_id = current_user["user_id"]
+    request_id = (request.request_id or "").strip() or None
+    _register_ppt_cancel_event(request_id)
+    cancel_check = lambda: _raise_if_ppt_cancelled(request_id)
 
     print(
         "[PPT] api: slide request "
@@ -3959,35 +4074,46 @@ def create_slide_ppt(
     if not assistant_message_id:
         raise HTTPException(status_code=400, detail="message_id is required")
 
-    cached_messages = _load_thread_messages_for_ppt(request.thread_id, current_user_id)
-    if not cached_messages:
-        raise HTTPException(status_code=404, detail="No messages found for thread")
+    try:
+        cached_messages = _load_thread_messages_for_ppt(request.thread_id, current_user_id)
+        if not cached_messages:
+            raise HTTPException(status_code=404, detail="No messages found for thread")
 
-    pair_messages = _select_user_assistant_pair(cached_messages, assistant_message_id)
-    langchain_messages = _build_langchain_messages_from_cached(pair_messages)
-    if not langchain_messages:
-        raise HTTPException(status_code=404, detail="No slide content available")
+        cancel_check()
+        pair_messages = _select_user_assistant_pair(cached_messages, assistant_message_id)
+        langchain_messages = _build_langchain_messages_from_cached(pair_messages)
+        if not langchain_messages:
+            raise HTTPException(status_code=404, detail="No slide content available")
 
-    chart_overrides = _decode_chart_images_base64(request.chart_images_base64)
-    if chart_overrides is None:
-        chart_override_path = _decode_chart_image_base64(request.chart_image_base64)
-        chart_overrides = [chart_override_path] if chart_override_path else None
+        chart_overrides = _decode_chart_images_base64(request.chart_images_base64)
+        if chart_overrides is None:
+            chart_override_path = _decode_chart_image_base64(request.chart_image_base64)
+            chart_overrides = [chart_override_path] if chart_override_path else None
 
-    output_path = _build_temp_ppt_path()
-    _generate_ppt_file(langchain_messages, output_path, chart_path_overrides=chart_overrides)
+        output_path = _build_temp_ppt_path()
+        _generate_ppt_file(
+            langchain_messages,
+            output_path,
+            chart_path_overrides=chart_overrides,
+            cancel_check=cancel_check,
+        )
 
-    chatbot_instance = _get_chatbot()
-    thread_title = _get_thread_title(chatbot_instance, request.thread_id, current_user_id)
-    filename = _build_ppt_filename(thread_title, "slide")
-    disposition = _normalize_disposition(request.disposition)
+        chatbot_instance = _get_chatbot()
+        thread_title = _get_thread_title(chatbot_instance, request.thread_id, current_user_id)
+        filename = _build_ppt_filename(thread_title, "slide")
+        disposition = _normalize_disposition(request.disposition)
 
-    background_tasks.add_task(_safe_unlink, output_path)
-    print(f"[PPT] api: slide response ready thread={request.thread_id} output={output_path}")
-    return FileResponse(
-        output_path,
-        media_type=PPTX_MEDIA_TYPE,
-        headers={"Content-Disposition": f"{disposition}; filename=\"{filename}\""},
-    )
+        background_tasks.add_task(_safe_unlink, output_path)
+        print(f"[PPT] api: slide response ready thread={request.thread_id} output={output_path}")
+        return FileResponse(
+            output_path,
+            media_type=PPTX_MEDIA_TYPE,
+            headers={"Content-Disposition": f"{disposition}; filename=\"{filename}\""},
+        )
+    except PptCancelledError:
+        raise HTTPException(status_code=499, detail="PPT generation cancelled")
+    finally:
+        _clear_ppt_cancel_event(request_id)
 
 
 @app.post("/api/v1/pptx/deck")
@@ -3998,6 +4124,9 @@ def create_deck_ppt(
 ) -> FileResponse:
     current_user = _get_request_user(raw_request)
     current_user_id = current_user["user_id"]
+    request_id = (request.request_id or "").strip() or None
+    _register_ppt_cancel_event(request_id)
+    cancel_check = lambda: _raise_if_ppt_cancelled(request_id)
 
     print(
         "[PPT] api: deck request "
@@ -4007,34 +4136,45 @@ def create_deck_ppt(
     if not _is_thread_visible(None, request.thread_id, current_user_id):
         raise HTTPException(status_code=404, detail="Thread not found")
 
-    cached_messages = _load_thread_messages_for_ppt(request.thread_id, current_user_id)
-    if not cached_messages:
-        raise HTTPException(status_code=404, detail="No messages found for thread")
+    try:
+        cached_messages = _load_thread_messages_for_ppt(request.thread_id, current_user_id)
+        if not cached_messages:
+            raise HTTPException(status_code=404, detail="No messages found for thread")
 
-    langchain_messages = _build_langchain_messages_from_cached(cached_messages)
-    if not langchain_messages:
-        raise HTTPException(status_code=404, detail="No deck content available")
+        cancel_check()
+        langchain_messages = _build_langchain_messages_from_cached(cached_messages)
+        if not langchain_messages:
+            raise HTTPException(status_code=404, detail="No deck content available")
 
-    chart_overrides = _decode_chart_images_base64(request.chart_images_base64)
-    if chart_overrides is None:
-        chart_override_path = _decode_chart_image_base64(request.chart_image_base64)
-        chart_overrides = [chart_override_path] if chart_override_path else None
+        chart_overrides = _decode_chart_images_base64(request.chart_images_base64)
+        if chart_overrides is None:
+            chart_override_path = _decode_chart_image_base64(request.chart_image_base64)
+            chart_overrides = [chart_override_path] if chart_override_path else None
 
-    output_path = _build_temp_ppt_path()
-    _generate_ppt_file(langchain_messages, output_path, chart_path_overrides=chart_overrides)
+        output_path = _build_temp_ppt_path()
+        _generate_ppt_file(
+            langchain_messages,
+            output_path,
+            chart_path_overrides=chart_overrides,
+            cancel_check=cancel_check,
+        )
 
-    chatbot_instance = _get_chatbot()
-    thread_title = _get_thread_title(chatbot_instance, request.thread_id, current_user_id)
-    filename = _build_ppt_filename(thread_title, "deck")
-    disposition = _normalize_disposition(request.disposition)
+        chatbot_instance = _get_chatbot()
+        thread_title = _get_thread_title(chatbot_instance, request.thread_id, current_user_id)
+        filename = _build_ppt_filename(thread_title, "deck")
+        disposition = _normalize_disposition(request.disposition)
 
-    background_tasks.add_task(_safe_unlink, output_path)
-    print(f"[PPT] api: deck response ready thread={request.thread_id} output={output_path}")
-    return FileResponse(
-        output_path,
-        media_type=PPTX_MEDIA_TYPE,
-        headers={"Content-Disposition": f"{disposition}; filename=\"{filename}\""},
-    )
+        background_tasks.add_task(_safe_unlink, output_path)
+        print(f"[PPT] api: deck response ready thread={request.thread_id} output={output_path}")
+        return FileResponse(
+            output_path,
+            media_type=PPTX_MEDIA_TYPE,
+            headers={"Content-Disposition": f"{disposition}; filename=\"{filename}\""},
+        )
+    except PptCancelledError:
+        raise HTTPException(status_code=499, detail="PPT generation cancelled")
+    finally:
+        _clear_ppt_cancel_event(request_id)
 
 
 @app.post("/api/v1/pptx/preview")
@@ -4044,6 +4184,9 @@ def preview_ppt(
 ) -> dict[str, Any]:
     current_user = _get_request_user(raw_request)
     current_user_id = current_user["user_id"]
+    request_id = (request.request_id or "").strip() or None
+    _register_ppt_cancel_event(request_id)
+    cancel_check = lambda: _raise_if_ppt_cancelled(request_id)
 
     print(
         "[PPT] api: preview request "
@@ -4053,29 +4196,52 @@ def preview_ppt(
     if not _is_thread_visible(None, request.thread_id, current_user_id):
         raise HTTPException(status_code=404, detail="Thread not found")
 
-    cached_messages = _load_thread_messages_for_ppt(request.thread_id, current_user_id)
-    if not cached_messages:
-        raise HTTPException(status_code=404, detail="No messages found for thread")
+    try:
+        cached_messages = _load_thread_messages_for_ppt(request.thread_id, current_user_id)
+        if not cached_messages:
+            raise HTTPException(status_code=404, detail="No messages found for thread")
 
-    assistant_message_id = _normalize_optional_text(request.message_id)
-    if assistant_message_id:
-        cached_messages = _select_user_assistant_pair(cached_messages, assistant_message_id)
+        assistant_message_id = _normalize_optional_text(request.message_id)
+        if assistant_message_id:
+            cached_messages = _select_user_assistant_pair(cached_messages, assistant_message_id)
 
-    langchain_messages = _build_langchain_messages_from_cached(cached_messages)
-    if not langchain_messages:
-        raise HTTPException(status_code=404, detail="No preview content available")
+        cancel_check()
+        langchain_messages = _build_langchain_messages_from_cached(cached_messages)
+        if not langchain_messages:
+            raise HTTPException(status_code=404, detail="No preview content available")
 
-    chart_overrides = _decode_chart_images_base64(request.chart_images_base64)
-    if chart_overrides is None:
-        chart_override_path = _decode_chart_image_base64(request.chart_image_base64)
-        chart_overrides = [chart_override_path] if chart_override_path else None
+        chart_overrides = _decode_chart_images_base64(request.chart_images_base64)
+        if chart_overrides is None:
+            chart_override_path = _decode_chart_image_base64(request.chart_image_base64)
+            chart_overrides = [chart_override_path] if chart_override_path else None
 
-    slides = _build_preview_payload(langchain_messages, chart_path_overrides=chart_overrides)
-    if not slides:
-        raise HTTPException(status_code=404, detail="No preview content available")
+        slides = _build_preview_payload(
+            langchain_messages,
+            chart_path_overrides=chart_overrides,
+            cancel_check=cancel_check,
+        )
+        if not slides:
+            raise HTTPException(status_code=404, detail="No preview content available")
 
-    print(f"[PPT] api: preview response ready thread={request.thread_id} slides={len(slides)}")
-    return {"slides": slides}
+        print(
+            f"[PPT] api: preview response ready thread={request.thread_id} slides={len(slides)}"
+        )
+        return {"slides": slides}
+    except PptCancelledError:
+        raise HTTPException(status_code=499, detail="PPT generation cancelled")
+    finally:
+        _clear_ppt_cancel_event(request_id)
+
+
+@app.post("/api/v1/pptx/cancel")
+def cancel_ppt(
+    request: PptCancelRequest,
+    raw_request: Request,
+) -> dict[str, bool]:
+    _get_request_user(raw_request)
+    request_id = request.request_id.strip()
+    cancelled = _cancel_ppt_request(request_id)
+    return {"cancelled": cancelled}
 
 
 @app.get("/api/v1/history")

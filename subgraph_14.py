@@ -55,6 +55,31 @@ def run_snowflake_query(query):
 
     return df
 
+# def run_snowflake_query(query):
+#     conn = snowflake.connector.connect(
+#     user="greddy@geron.com",
+#     account="hbc62861.us-east-1",
+#     authenticator="externalbrowser",
+#     warehouse="SF030_P_WHS_GERN_ZDH_GEN01",
+#     database="P_GERN_030_ZDH_01",
+#     schema="SELF_SERVE_ACUITAS_ANALYTICS"
+# )
+
+#     cursor = conn.cursor()
+#     cursor.execute(query)
+
+#     # Fetch data
+#     data = cursor.fetchall()
+#     columns = [col[0] for col in cursor.description]
+
+#     # Convert to DataFrame
+#     df = pd.DataFrame(data, columns=columns)
+
+#     cursor.close()
+#     conn.close()
+
+#     return df
+
 def load_masking_table_snowflake() -> None:
     """
     Load masking mappings directly from a Snowflake table.
@@ -927,6 +952,8 @@ RULES
 def query_decomposer_node(state: AgentState):
     review = state["active_review"]
     user_input=state["question"]
+    print("User Input")
+    print(user_input)
     messages=state['messages']
     query_decomposer_rag_examples_text=state['query_decomposer_rag_examples_text']
     
@@ -934,9 +961,9 @@ def query_decomposer_node(state: AgentState):
     last_human_message = next(
     msg for msg in reversed(messages) if isinstance(msg, HumanMessage)
 )
-    user_input=last_human_message.content
+    last_human_text=last_human_message.content
     print("Last Human Message")
-    print(user_input)
+    print(last_human_text)
     print("-"*100)
     if review and (review["decision"] == "REJECT"):
 
@@ -988,6 +1015,8 @@ def query_decomposer_node(state: AgentState):
     ────────────────────────
     Metric & Output Handling Rules (Must Always Be Enforced):
     ────────────────────────
+    ⚠️ STRICT RULE — If the user mentions a value followed by or associated with a column identifier (e.g. "Seattle, WA" in "campus_territory", "West" in "campus_region", "FastMed" in "campus_account"), treat the FULL associated value (e.g. "Seattle, WA") from that column as the intended entity — never just the partial word the user typed. NEVER break it down into its individual components such as city, state, zip code, or any other geographic or administrative subdivision. The complete canonical value must be preserved exactly as it exists in the data — splitting it in any way is a critical failure.
+    ⚠️ STRICT RULE — When a campus location value is provided (e.g. "Seattle, WA"), NEVER decompose it into separate city and state filter conditions like campus_city = 'Seattle' AND campus_state = 'WA'. Instead, always treat it as a single atomic value and filter directly on the canonical column it belongs to (e.g. campus_territory = 'Seattle, WA'). Breaking a location value into its geographic components (city, state, zip, etc.) and filtering on them separately is a critical failure.
     NEVER generate or guess any ID (campus_id, region_id, geography_id, or any other identifier) — always anchor strictly to IDs present in the data, and always include them in your output wherever applicable.
     Display both period-level metrics and daily average metrics ONLY when the period is complete. If the period is incomplete, display only daily average metrics with total Volume Sales., where Daily Average = Total / COUNT(DISTINCT CASE WHEN is_business_day = 1 THEN date END computed at NATIONAL level) (VERY IMPORTANT).
     All business day calculations MUST be performed strictly at the national level only, and must NEVER be derived from any regional, tier, territory, or segmented data.
@@ -1486,6 +1515,8 @@ USER QUERY (LATEST HUMAN MESSAGE)
   ────────────────────────
     Metric & Output Handling Rules (Must Always Be Enforced):
     ────────────────────────
+    ⚠️ STRICT RULE — If the user mentions a value followed by or associated with a column identifier (e.g. "Seattle, WA" in "campus_territory", "West" in "campus_region", "FastMed" in "campus_account"), treat the FULL associated value (e.g. "Seattle, WA") from that column as the intended entity — never just the partial word the user typed. NEVER break it down into its individual components such as city, state, zip code, or any other geographic or administrative subdivision. The complete canonical value must be preserved exactly as it exists in the data — splitting it in any way is a critical failure.
+    ⚠️ STRICT RULE — When a campus location value is provided (e.g. "Seattle, WA"), NEVER decompose it into separate city and state filter conditions like campus_city = 'Seattle' AND campus_state = 'WA'. Instead, always treat it as a single atomic value and filter directly on the canonical column it belongs to (e.g. campus_territory = 'Seattle, WA'). Breaking a location value into its geographic components (city, state, zip, etc.) and filtering on them separately is a critical failure.
     NEVER generate or guess any ID (campus_id, region_id, geography_id, or any other identifier) — always anchor strictly to IDs present in the data, and always include them in your output wherever applicable.
     Display both period-level metrics and daily average metrics ONLY when the period is complete. If the period is incomplete, display only daily average metrics with total Volume Sales. where Daily Average = Total / COUNT(DISTINCT CASE WHEN is_business_day = 1 THEN date END computed at NATIONAL level)(VERY IMPORTANT).
     All business day calculations MUST be performed strictly at the national level only, and must NEVER be derived from any regional, tier, territory, or segmented data.
@@ -2035,7 +2066,8 @@ VALIDATION BEFORE OUTPUT:
 ────────────────────────
 Metric & Output Handling Rules (Must Always Be Enforced):
 ────────────────────────
-All growth metrics must be expressed in percentage (%) format.
+⚠️ STRICT RULE — If the user mentions a value followed by or associated with a column identifier (e.g. "Seattle, WA" in "campus_territory", "West" in "campus_region", "FastMed" in "campus_account"), treat the FULL associated value (e.g. "Seattle, WA") from that column as the intended entity — never just the partial word the user typed. NEVER break it down into its individual components such as city, state, zip code, or any other geographic or administrative subdivision. The complete canonical value must be preserved exactly as it exists in the data — splitting it in any way is a critical failure.
+⚠️ STRICT RULE — When a campus location value is provided (e.g. "Seattle, WA"), NEVER decompose it into separate city and state filter conditions like campus_city = 'Seattle' AND campus_state = 'WA'. Instead, always treat it as a single atomic value and filter directly on the canonical column it belongs to (e.g. campus_territory = 'Seattle, WA'). Breaking a location value into its geographic components (city, state, zip, etc.) and filtering on them separately is a critical failure.
 Always append “%” to all growth and contribution values in the output.
 All computations related to growth, decline, and weekly averages must be converted to integers (no decimals) before reporting the results.
 
@@ -2889,7 +2921,7 @@ def summarizer_node(state: AgentState):
         {sql_generator_output}
 
         SQL Executor Output:
-        {sql_executor_output}
+        {masked_df}
 
 
         ---
@@ -3348,7 +3380,7 @@ def summarizer_node(state: AgentState):
 
 def visualization_node(state: AgentState):
     query_decomposer_output=state["query_decomposer_output"]
-    
+    user_query=state["question"]
     sql_executor_output=state["sql_executor_output"]
     result_df=deserialize_df(sql_executor_output)
     masked_df=mask_dataframe(result_df)
@@ -3357,195 +3389,235 @@ def visualization_node(state: AgentState):
     print(descriptive_stats)
     columns = sql_executor_output["columns"]
     num_rows = len(sql_executor_output["data"])
+    summary=state["result_summary"]
 
     sql_generator_output=state["sql_generator_output"]
 
 
     #result_summary=state["result_summary"]
     prompt=f"""
-   You are a Visualization Agent.
-
+You are a Visualization Agent.
+ 
 Your goal is to create a meaningful, accurate, and non-misleading Plotly visualization ONLY when the data supports it.
-
+ 
 You MUST prioritize correctness over forcing a chart.
-
+ 
 ---
-
+ 
 ## INPUTS
-
+ 
+User Query:
+{user_query}
+ 
 Query Decomposer Output:
 {query_decomposer_output}
-
+ 
 SQL Generator Output:
 {sql_generator_output}
-
+ 
 SQL Executor Output (masked schema; do not use raw masked column names directly):
 {masked_df}
-
+ 
 SQL Executor Output Descriptive Stats:
 {descriptive_stats}
-
-
+ 
+SUMMARY-DRIVEN VISUALIZATION RULE — METRIC PRIORITIZATION
+{summary}
+ 
+Before writing any Plotly code, parse the entire summary and extract every metric, KPI, figure, percentage, trend, and named entity from the Findings, Key Takeaways, and Opportunities sections. This extracted list is your visualization brief — it overrides all default data-driven decisions. If the data has 50 columns but the summary mentions 6 metrics, visualize those 6 only.
+ 
+METRIC HIERARCHY IN CODE:
+- Findings → primary Y-axis and dominant visual elements (tallest bars, main lines)
+- Key Takeaways → reference lines and direct annotations on the chart — never buried in tooltips
+- Opportunities → gap overlays, delta annotations, or target markers in a visually distinct color — always showing the gap between current state and potential, not just raw numbers
+ 
+HARD RULES:
+1. If a Finding and an Opportunity reference the same entity, they MUST appear on the same chart so the gap is immediately visible
+2. Every metric name on axes, hovers, and annotations must match the summary word-for-word ("Net Revenue" stays "Net Revenue" — never "Sales" or "Revenue")
+3. Every figure, percentage, and named comparison from the summary MUST appear somewhere in the visualization — as a bar, line, reference line, annotation, or hover value. A metric present in the summary but absent from the chart is a bug
+4. Before finalizing the code, audit every bullet in Findings, Key Takeaways, and Opportunities and confirm each one has a visual representation. Only return code when all metrics are accounted for
+ 
 Assume the SQL output will be reconstructed into a Pandas DataFrame named df.
-
+ 
 ---
-
+ 
 ## CORE DECISION LOGIC (MANDATORY)
-
+ 
 Before generating a chart, you MUST:
-
+ 
 1. Identify column types:
-
+ 
    * Numeric columns
    * Categorical columns
    * Datetime or ordered columns
-
+ 
 2. Determine analytical intent:
-
+ 
    * Trend → requires datetime or ordered column
    * Comparison → categorical vs numeric
    * Distribution → single numeric column
    * Ranking → categorical + numeric
    * Relationship → at least two numeric columns
-
+ 
 3. Validate if visualization is appropriate:
-
+ 
    * If only 1 column → NO_VISUALIZATION
    * If all columns are categorical → NO_VISUALIZATION
    * If data is too small, ambiguous, or lacks structure → NO_VISUALIZATION
    * If visualization would be misleading → NO_VISUALIZATION
    
-4. Time Axis Rule: Use the dataset’s exact time granularity (week/month/quarter) for the X-axis—no transformations or mixing.
+4. Time Axis Rule: Use the dataset's exact time granularity (week/month/quarter) for the X-axis—no transformations or mixing.
 ---
-
+ 
 ## ENHANCED INTENT DETECTION (ADDED)
-
+ 
 In addition to the above, refine intent using semantic signals from the question:
-
+ 
 * Trend Analysis:
   Keywords → "trend", "over time", "evolution", "recent", "momentum"
-
+ 
 * Regional / Segment Comparison:
   Keywords → "across regions", "by tier", "comparison"
-
+ 
 * Contribution / Drivers:
   Keywords → "driving", "contribution", "dependent", "share of"
-
+ 
 * Consistency / Variability:
   Keywords → "consistent", "variability", "spread"
-
+ 
 * Adoption / Funnel / Health:
   Keywords → "adoption", "funnel", "health", "status", "conversion"
-
+ 
 * Market Share:
   Keywords → "market share", "gaining share", "losing share"
-
+ 
 * Competitive Comparison:
   Keywords → multiple entities (e.g., relmora vs zynava)
-
+ 
 * Multi-dimensional:
   Keywords → combinations like "region and tier"
-
+ 
 ---
-
+ 
 ## CHART SELECTION RULES (STRICT)
-
+ 
 * Line Chart:
   Use ONLY if a datetime or ordered column exists
-
+ 
 * Bar Chart:
   Use for categorical vs numeric comparisons
-
+ 
 * Scatter Plot:
   Use ONLY if at least 2 numeric columns exist
-
+ 
 * Histogram:
   Use for distribution of a single numeric column
-
+ 
 * Pie Chart:
   Use ONLY if:
-
+ 
   * ≤ 6 categories
   * Represents part-to-whole relationship
-
+  * PREFERRED over bar chart when showing tier-wise or segment-wise distribution as a share of total (e.g., "tier distribution", "segment breakdown", "% share by tier")
+ 
 * Flat/tabular outputs with no clear analytical mapping:
   Return NO_VISUALIZATION
-
+ 
 * If multiple chart types are possible:
   Choose the simplest and most interpretable one
-
+ 
 ---
-
+ 
 ## ADVANCED CHART OVERRIDES (ADDED - HIGH PRIORITY)
-
+ 
 These rules OVERRIDE basic rules when applicable:
-
+ 
 1. Trend + Multiple Categories:
    → Use MULTI-LINE chart (color by category)
-
+ 
 2. Contribution / Share:
    → Prefer STACKED BAR
    → If time present → STACKED AREA
-
+ 
 3. Market Share:
    → ALWAYS convert to percentage if possible
    → Use:
-
+ 
    * STACKED AREA (time)
    * 100% STACKED BAR (snapshot)
-
+ 
 4. Performance vs Target:
    → Prefer grouped bar (actual vs target)
    → If unclear → fallback to bar chart
-
+ 
 5. Multi-dimensional (2 categorical variables):
    → Prefer HEATMAP (if dense data)
    → Else GROUPED BAR
-
+ 
 6. Adoption / Health Categories:
    → STACKED BAR (if categorical states exist)
-
+ 
 7. Consistency / Variability:
    → If enough data → BOX PLOT
    → Else fallback to bar/line
-
+ 
+8. Tier-wise or Segment Distribution (part-to-whole, no time axis):
+   → ALWAYS use PIE CHART when ≤ 6 segments and the intent is "what share does each segment represent"
+   → Show percentage labels directly on slices, not just in hover
+ 
+9. Cross-entity Distribution Comparison (e.g., relmora vs zynava tier-wise):
+   → ALWAYS use percentage proportions (%) not absolute values (mg) on the Y-axis
+   → Use GROUPED BAR with percentage labels so the comparison is meaningful across entities with different total volumes
+ 
 ---
-
+ 
 ## GROWTH RULE (VERY IMPORTANT)
-
+ 
 If any growth-related column exists (growth, %, change, WoW, MoM, QoQ, YoY):
-
+ 
 * You MUST include BOTH:
-
+ 
   * Base metric (bar or line)
   * Growth metric (secondary axis)
-
+ 
 * Use make_subplots with secondary_y=True
-
+ 
 * DO NOT mix axis strategies:
-
+ 
   * If using secondary_y=True → use make_subplots ONLY
   * NEVER manually assign yaxis='y2'
-
+ 
 ---
-
+ 
+## METRIC FIDELITY RULE (CRITICAL — NEW)
+ 
+The chart MUST display exactly the metric the user asked for — never substitute a different metric even if it is available in the data:
+ 
+* If the user asked for "average calls per day" → plot avg_calls_per_day, NOT total_calls
+* If the user asked for "daily average sales" → plot daily_avg_sales, NOT total_sales
+* If the user asked for "% market share" → plot percentage share, NOT absolute mg
+* If both total and average are available and the user asked for average → use average as the primary Y-axis; total may appear as a secondary trace only if it adds context
+* Before finalizing, re-read the user query and confirm every Y-axis value matches the requested metric exactly
+ 
+---
+ 
 ## COLUMN USAGE RULES
-
+ 
 * Use ONLY columns present in df
-
+ 
 * NEVER invent or infer missing columns
-
+ 
 * Preferred mappings:
-
+ 
   * x → categorical or datetime column
   * y → numeric column(s)
-
+ 
 ---
-
+ 
 ## VISUAL ENHANCEMENT RULES (ADDED)
-
+ 
 When generating charts, apply:
-
+ 
 * Sort categorical axes in descending order (for comparison charts)
 * Highlight latest time point (for trend charts)
 * Limit categories to top 10 if too many values
@@ -3554,51 +3626,52 @@ When generating charts, apply:
 * Ensure readability over aesthetics
 * CRITICAL RULE: Always display geography/region names instead of geography or region IDs in visualizations.
 * All visualizations must display visible data labels for every data point.
-
+* For pie charts: always show both the category label and the percentage value directly on each slice using textinfo="label+percent".
+ 
 ---
-
+ 
 ## SPECIAL HANDLING RULES
-
+ 
 * Growth queries:
   → Always prioritize showing trend + growth together
-
+ 
 * Recent period queries:
   → Focus on latest available time window
-
+ 
 * Regional queries:
   → Ensure comparisons are clearly distinguishable
-
+ 
 * Market share queries:
   → Prefer percentage representation over absolute values
-
+ 
 * Multi-level queries:
   → Prefer grouped or heatmap visualization
-
+ 
 * Growth Questions (Single-Row Output)
  → If the question is about growth and the output has only 1 row: always render a bar chart. Show bars for the previous and current period using whichever metrics are available — prefer both total growth and daily average growth side by side; fall back to daily average growth alone if total is absent. Never skip the chart.
-
+ 
 ---
-
+ 
 ## PLOTLY RULES (MANDATORY)
-
+ 
 * Use Plotly only (plotly.express or plotly.graph_objects)
 * Output ONLY valid Python code defining `fig`
 * No explanations, no comments, no markdown
 * No Streamlit code
-
+ 
 ---
-
+ 
 ## LAYOUT / WIDTH RULE (CRITICAL)
-
+ 
 * Plotly `width` MUST be a numeric value (e.g., 600, 800, 1000)
 * NEVER use 'stretch' or 'content' inside fig.update_layout()
 * NEVER use `use_container_width`
 * The rendering layer (e.g., Streamlit) will handle container sizing
-
+ 
 ---
-
+ 
 ## HOVERTEMPLATE RULES (MANDATORY)
-
+ 
 * NEVER use Python `%` string formatting
 * ALWAYS use f-strings
 * Preserve Plotly placeholders like `%{{x}}`, `%{{y}}`
@@ -3607,8 +3680,52 @@ When generating charts, apply:
 * Do NOT mix `%` formatting with Plotly placeholders
 * Every value representing growth, rate, or percentage MUST include the '%' symbol—no exceptions, no alternative formats.
 ---
+ 
+PLOTLY VISUALIZATION RULES — ALWAYS ENFORCE ALL:
+ 
+RULE 1 — PERIOD COMPARISONS: Never display a chart that only compares the number of days between a current period and a previous period. Every period comparison MUST always include all three metrics: total volume sales, daily average sales, and growth change (%).
+ 
+RULE 2 — NO IDS ON CHARTS: Never display raw ID fields anywhere on a chart — no axes, labels, legends, hovers, or titles. This includes campus_id, campus_region_id, campus_territory_id, and parent_id. Always resolve to their human-readable name fields before plotting: campus_account_name, campus_region, campus_territory, parent_account_name. If a name is unavailable, show "Unknown" — never fall back to the numeric ID.
+ 
+RULE 3 — NO HH:MM:SS TIMESTAMPS: Never render timestamps in HH:MM:SS format on any axis, tick, label, or hover. Always strip time components when only the date is meaningful. Use human-readable date formats appropriate to the data granularity (e.g. "Jan 2024", "Q1 2024", "12 May"). Use Plotly's tickformat or pre-format the date column before plotting.
+  Implementation: Before plotting, convert date columns with:
+    df['date'] = pd.to_datetime(df['date']).dt.strftime('%b %Y')   # for monthly
+    df['date'] = pd.to_datetime(df['date']).dt.strftime('%d %b %Y')  # for daily
+  AND set fig.update_xaxes(tickformat="%b %Y") as a backup.
+ 
+RULE 4 — NO OVERLAPPING DATA LABELS: On any chart combining bar and line traces, data labels must never overlap each other or any other chart element. Always set textposition="outside" for bar labels, increase layout.height for dense data, set cliponaxis=False, and add sufficient layout.margin.t so that labels above the highest bar are never clipped or collide with adjacent labels.
+  Additional enforcement:
+    - For multi-line charts with many data points: alternate label positions ("top center" and "bottom center") by trace so labels from different series never collide
+    - Set a minimum chart height of 500px; increase to 650px+ when 3 or more traces share the same x-axis range
+    - For bar+line combo charts: always offset bar labels (textposition="outside") and line labels (textposition="top center") with a minimum vertical gap of 15px between any two labels
+ 
+RULE 5 — HOVER TOOLTIPS MUST BE FULLY VISIBLE: Hover tooltips must never be partially cut off by the chart boundary, browser edge, or any container. Always set generous layout margins on all sides (minimum 60px), use hoverlabel=dict(namelength=-1) to prevent label truncation, set layout.hovermode="closest", and never place the chart inside a container with overflow: hidden. For data points near chart edges, ensure tooltips flip inward rather than getting clipped.
+ 
+Rule 6 - Never place any free-floating text, callouts, or arrow annotations inside the chart area that describe, interpret, or editorialize a data point — only numeric labels, axis titles, axis ticks, a legend, and reference line name labels sitting directly on their line are permitted.
+ 
+Rule 7 - Whenever the query involves a trend, growth, or change over time, always default to a line chart. NEVER use a stacked bar chart when the intent is to show how values change across time periods. A stacked bar with time on the X-axis is only acceptable when the explicit goal is part-to-whole composition at each time point (e.g., "what share does each tier contribute each month"), not for showing trends.
+ 
+Rule 8 - Never let data labels overlap — always stagger positions ("top center" / "bottom center"), ensure a minimum 15px gap between any two labels, and increase chart height when traces are dense.
+ 
+RULE 9 — NO LABELS OUTSIDE CHART BOUNDS: Data labels must never be clipped or rendered outside the visible chart area. Always:
+  - Set layout.margin.t to at least 80px to prevent top labels from being cut off
+  - Set cliponaxis=False on all traces
+  - For bar charts with tall bars, reduce font size of labels to 10px rather than letting them overflow
+  - Test that the highest data label has at least 40px of clearance below layout.margin.t
+ 
+RULE 10 — NO DUPLICATE OR BLURRED ENDPOINTS ON LINE CHARTS: When rendering line charts, never duplicate the final data point. Ensure:
+  - The data passed to the chart has no duplicate rows on the time axis (deduplicate with df.drop_duplicates(subset=[time_col]) before plotting)
+  - Do not add a separate scatter trace on top of a line trace for the last point unless it is intentionally styled differently (e.g., a highlighted endpoint marker); if doing so, use a distinct marker symbol and ensure it does not visually blur the line endpoint
+  - Set line.simplify=False to prevent Plotly's rendering simplification from creating visual artifacts at endpoints
+ 
+RULE 11 — NO REDUNDANT TIME PERIOD LABELS IN TABLE ROWS: When the chart or associated table has a time period column (e.g., "Period", "Month", "Quarter"), do not repeat the same period label on every row of the table if the chart already shows the time axis. If the period is the same for all rows in a grouped/filtered view, show it once in the chart title or as a subtitle annotation — not as a repeated column value in every row.
+ 
+RULE 12 — MARKET SHARE MUST SHOW PERCENTAGE: Any chart where the user asks for "market share", "share", "% share", or "proportion" MUST display percentage values on the Y-axis and in data labels, not raw mg or unit volumes. Convert to percentage before plotting:
+  df['relmora_share_pct'] = df['relmora_total_mg'] / (df['relmora_total_mg'] + df['zynava_total_mg']) * 100
+  If total market volume is unavailable, return NO_VISUALIZATION rather than showing misleading absolute values as market share.  
 
-TABLE SCHEMA:
+RULE 13 — ALWAYS INITIALIZE plot_df AFTER IMPORTS: In every visualization, the first executable statement following all import statements must be plot_df = df.copy(). Do not reference plot_df, df, or any derived DataFrame before this initialization line, and never assume df has been renamed or pre-assigned outside the visualization code block.  
+  TABLE SCHEMA:
 
 Table: data_867 — transaction-level sales dataset (weekly + campus-level analysis)
 - date (DATE): transaction date (YYYY-MM-DD)
@@ -3753,8 +3870,8 @@ def build_graph(checkpointer=None):
     # END
     #builder.add_edge("sql_reviewer","sql_executor")
     builder.add_edge("sql_executor","summarizer_node")
-    builder.add_edge("sql_executor","visualization_node")
-    builder.add_edge("summarizer_node","terminator")
+    builder.add_edge("summarizer_node","visualization_node")
+    #builder.add_edge("summarizer_node","terminator")
     builder.add_edge("visualization_node","terminator")
     builder.add_edge("terminator", END)
 

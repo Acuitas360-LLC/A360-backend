@@ -21,7 +21,7 @@ import logging
 import os
 import tempfile
 from datetime import date
-from typing import Any
+from typing import Any, Callable
 
 from pptx import Presentation
 from pptx.dml.color import RGBColor
@@ -305,7 +305,7 @@ explaining what the metric measures. Be specific, avoid filler words.
 ### STRICT GUIDELINES
 
 TITLE:
-- Max 20 words
+- Max 15 words
 - Grammatically correct version of: {question}
 - Preserve original meaning without adding new interpretation
 - Do not convert into an insight or statement beyond correcting grammar
@@ -336,7 +336,7 @@ INSIGHT:
 
 ### FINAL SELF-CHECK
 
-✔ Title ≤ 20 words  
+✔ Title ≤ 15 words  
 ✔ Exactly 3 bullets  
 ✔ Insight is actionable  
 ✔ KPIs match question type  
@@ -444,28 +444,38 @@ def generate_chart(block):
         return None
     
 
-def enrich_with_chart(slide):
+def enrich_with_chart(slide, cancel_check: Callable[[], None] | None = None):
+    if cancel_check:
+        cancel_check()
     chart_path = generate_chart({
         "data": slide["data"],
         "viz_code": slide["viz_code"],
         "viz_figure": slide.get("viz_figure"),
     })
+    if cancel_check:
+        cancel_check()
 
     slide["chart_path"] = chart_path
     return slide  
 
 
-def build_slide_data(messages, chart_path_overrides: list[str] | None = None):
+def build_slide_data(
+    messages,
+    chart_path_overrides: list[str] | None = None,
+    cancel_check: Callable[[], None] | None = None,
+):
     blocks = parse_conversation(messages)
     print(f"[PPT] slides: building (blocks={len(blocks)})")
     slides = []
     for index, block in enumerate(blocks):
+        if cancel_check:
+            cancel_check()
         slide = build_slide_object(block)
         if isinstance(chart_path_overrides, list):
             override = chart_path_overrides[index] if index < len(chart_path_overrides) else None
             slide["chart_path"] = override
         else:
-            slide = enrich_with_chart(slide)
+            slide = enrich_with_chart(slide, cancel_check=cancel_check)
         slides.append(slide)
     print(f"[PPT] slides: built (slides={len(slides)})")
     return slides
@@ -794,7 +804,7 @@ def _kpi_card(slide, label: str, value: str,
     p_lbl.alignment = PP_ALIGN.LEFT
     run_lbl = p_lbl.add_run()
     run_lbl.text = label
-    run_lbl.font.size = Pt(7.5)
+    run_lbl.font.size = Pt(9)
     run_lbl.font.bold = True
     run_lbl.font.name = theme["font_body"]
     run_lbl.font.color.rgb = theme["kpi_label_text"]
@@ -802,14 +812,14 @@ def _kpi_card(slide, label: str, value: str,
     rPr.set("spc", str(int(2.2 * 100)))
  
     # Value
-    tb = _tb(slide, inner_l, t + 0.33, inner_w, h - 0.38)
+    tb = _tb(slide, inner_l, t + 0.40, inner_w, h - 0.42)
     tf = tb.text_frame
     tf.word_wrap = True
     p = tf.paragraphs[0]
     p.alignment = PP_ALIGN.LEFT
     run = p.add_run()
     run.text = value
-    run.font.size = Pt(22 if len(value) > 12 else 26)
+    run.font.size = Pt(12 if len(value) > 12 else 14)
     run.font.bold = True
     run.font.name = theme["font_title"]
     run.font.color.rgb = theme["title_text"]
@@ -932,7 +942,7 @@ def create_ppt(slide_data: dict,
     # Title
     tb = _tb(slide, CONTENT_L, MARGIN_T + SUBTITLE_H, W - MARGIN_L - MARGIN_R, TITLE_H)
     _para(tb, slide_data.get("title", "Untitled"),
-          20, bold=True, color=theme["title_text"], font=theme["font_title"])
+          14, bold=True, color=theme["title_text"], font=theme["font_title"])
  
     # Divider
     _rect(slide, CONTENT_L, DIVIDER_Y, CONTENT_W, DIVIDER_H, theme["divider"])
@@ -980,7 +990,7 @@ def create_ppt(slide_data: dict,
 
             # Definition text box — pinned to bottom of each card
             if definition:
-                DEF_H   = 0.22
+                DEF_H   = 0.28
                 DEF_PAD = 0.06
                 tb = _tb(slide,
                          KPI_X + DEF_PAD,
@@ -993,7 +1003,7 @@ def create_ppt(slide_data: dict,
                 p.alignment = PP_ALIGN.LEFT
                 run = p.add_run()
                 run.text = definition
-                run.font.size = Pt(6.5)
+                run.font.size = Pt(7)
                 run.font.color.rgb = theme.get("muted_text", RGBColor(0x99, 0x99, 0x99))
                 run.font.name = theme["font_body"]
                 run.font.italic = True
@@ -1013,7 +1023,7 @@ def create_ppt(slide_data: dict,
         # --- LOGO BELOW LABEL (no overlap now) ---
         LOGO_W = 0.8
         LOGO_H = 0.4
-        LOGO_MARGIN = 0.2
+        LOGO_MARGIN = 0.1
 
         if logo_path and os.path.exists(logo_path):
             slide.shapes.add_picture(
@@ -1072,6 +1082,7 @@ def build_ppt(
     uploaded_pptx_path: str | None = "Geron.pptx",
     logo_path: str | None = "Geron_Logo.png",
     chart_path_overrides: list[str] | None = None,
+    cancel_check: Callable[[], None] | None = None,
 ) -> str:
     resolved_template = (
         uploaded_pptx_path
@@ -1087,12 +1098,22 @@ def build_ppt(
         f"output={output_path} template={resolved_template or ''} logo={resolved_logo or ''}"
     )
  
-    slides = build_slide_data(messages, chart_path_overrides=chart_path_overrides)
+    if cancel_check:
+        cancel_check()
+    slides = build_slide_data(
+        messages,
+        chart_path_overrides=chart_path_overrides,
+        cancel_check=cancel_check,
+    )
  
     prs = None
     for slide in slides:
+        if cancel_check:
+            cancel_check()
         prs = create_ppt(slide, prs, theme=theme, logo_path=resolved_logo)
  
+    if cancel_check:
+        cancel_check()
     prs.save(output_path)
     print(f"[PPT] build: saved output={output_path} slides={len(slides)}")
 

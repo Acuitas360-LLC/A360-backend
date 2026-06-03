@@ -21,6 +21,352 @@ from langchain_core.messages import HumanMessage
 load_dotenv()
 model = ChatOpenAI(model="gpt-5.4")
 openai_api_key = os.getenv("OPENAI_API_KEY")
+from rapidfuzz import process, fuzz
+from collections import defaultdict
+
+
+SNOWFLAKE_CONFIG = {
+    "user":"ahusain",
+    "password":"Murtaza@40401059",
+    "account":"ua60309.south-central-us.azure",
+    "warehouse":"RELMORA_COMPUTE",
+    "database":"RELMORA_DB",
+    "schema":"RELMORA_SCHEMA_2"
+}
+
+# ---------- Global Dictionary ----------
+MASKING_TABLE_DICT = {}
+
+def load_masking_table(table_name: str = "MASK_MAPPING") -> dict:
+    """
+    Loads the masking table from Snowflake and converts it into:
+    {
+        "territory_name": ["North Territory", "South Territory", ...],
+        "state_name":     ["Telangana", "Maharashtra", ...],
+        "city_name":      ["Hyderabad", "Mumbai", ...],
+        ...
+    }
+    """
+    global MASKING_TABLE_DICT
+
+    try:
+        conn   = snowflake.connector.connect(**SNOWFLAKE_CONFIG)
+        cursor = conn.cursor()
+
+        cursor.execute(f"SELECT column_name, original_value FROM {table_name}")
+        rows = cursor.fetchall()
+
+        # Build dictionary — group original_values under each column_name
+        result = defaultdict(list)
+        for column_name, original_value in rows:
+            result[column_name].append(original_value)
+
+        # Convert to regular dict and store globally
+        MASKING_TABLE_DICT = dict(result)
+
+        print(f"✅ Masking table loaded: {len(MASKING_TABLE_DICT)} columns, "
+              f"{sum(len(v) for v in MASKING_TABLE_DICT.values())} total values")
+
+    except Exception as e:
+        print(f"❌ Failed to load masking table: {e}")
+        raise
+
+    finally:
+        cursor.close()
+        conn.close()
+
+    return MASKING_TABLE_DICT
+
+# Define your fallback column priority order here
+COLUMN_FALLBACK_ORDER = [
+    "campus_region",
+    "campus_territory", 
+    "campus_account_name"
+    # add more columns in priority order as needed
+]
+
+def fallback_column_search(entity_value, masking_table, threshold=70):
+    """
+    When column_name is unknown, try each column in priority order.
+    Returns first confident match found.
+    """
+    for column in COLUMN_FALLBACK_ORDER:
+        if column not in masking_table:
+            continue
+
+        corrected_value, score, status = fuzzy_correct(column, entity_value, masking_table, threshold)
+
+        if status in ("exact", "case_corrected", "fuzzy_corrected"):
+            print(f"🔍 Fallback matched '{entity_value}' → '{corrected_value}' in column '{column}' (score: {score})")
+            return column, corrected_value, score, status
+
+    print(f"⚠️ Fallback exhausted all columns for '{entity_value}', no match found")
+    return None, entity_value, None, "no_match"
+
+def extract_entities_from_query(user_query, valid_columns):
+    prompt = f"""
+    Available columns: {valid_columns}
+
+    From the user query below, extract ALL entities that correspond to 
+    any of the available columns above.
+
+    Return ONLY a JSON array like:
+    [
+        {{"column_name": "state_name", "entity_value": "Telangana"}},
+        {{"column_name": null,         "entity_value": "Sttle"}}
+    ]
+
+    Rules:
+    - Only if in the Query it is expliciittly mentioned mentioned about the column_name then only take that as a column name or else mark it as null (VERY IMPORTANT). For Exxample west region, then onlyy consider westt to be region if nothing is mention cconsider it to be null.
+    - column_name must always be one of the available columns listed above, or null if unsure
+    - Extract as many entities as present in the query
+    - Don't add any prefix or suffix to the entity name
+    - If no entity is found for a column, skip it
+    - Return empty array [] if nothing relevant is found
+
+    User query: "{user_query}"
+    """
+    response = model.invoke(prompt).content
+
+    try:
+        clean    = response.strip().replace("```json", "").replace("```", "")
+        entities = json.loads(clean)
+        return entities if isinstance(entities, list) else []
+    except json.JSONDecodeError:
+        print("⚠️ Failed to parse LLM response as JSON")
+        return []
+
+# ---------- Step 2: Fuzzy match a single entity ----------
+def fuzzy_correct(column_name, entity_value, masking_table, threshold=70):
+    valid_values = masking_table.get(column_name, [])
+    print("Valid Values")
+    print(valid_values)
+
+    if not valid_values:
+        return entity_value, None, "unknown_column"
+
+    # Exact match — no correction needed
+    if entity_value in valid_values:
+        return entity_value, 100, "exact"
+
+    # Case-insensitive exact match
+    lower_map = {v.lower(): v for v in valid_values}
+    if entity_value.lower() in lower_map:
+        return lower_map[entity_value.lower()], 100, "case_corrected"
+
+    # Fuzzy match
+    result = process.extractOne(
+        entity_value,
+        valid_values,
+        scorer=fuzz.token_set_ratio
+    )
+
+    print("Result")
+    print(result)
+
+    if result:
+        match, score, _ = result
+        if score >= threshold:
+            return match, score, "fuzzy_corrected"
+
+    return entity_value, None, "no_match"
+
+
+# ---------- Step 3: Correct ALL entities ----------
+def correct_all_entities(entities, masking_table):
+    corrections = []
+
+    for item in entities:
+        col             = item["column_name"]
+        value           = item["entity_value"]
+        was_column_null = col is None  # ✅ capture before any resolution
+
+        if col is None:
+            print(f"🔎 Column unknown for '{value}', trying fallback column search...")
+            col, corrected_value, score, status = fallback_column_search(value, masking_table)
+        else:
+            corrected_value, score, status = fuzzy_correct(col, value, masking_table)
+
+        corrections.append({
+            "column_name":     col,
+            "original_value":  value,
+            "corrected_value": corrected_value,
+            "score":           score,
+            "status":          status,
+            "was_column_null": was_column_null  # ✅ store the flag
+        })
+
+        if status == "exact":
+            print(f"✅ '{value}' → exact match in '{col}'")
+        elif status in ("case_corrected", "fuzzy_corrected"):
+            print(f"🔧 '{value}' → '{corrected_value}' in '{col}' (score: {score})")
+        elif status == "no_match":
+            print(f"⚠️ '{value}' → no match found anywhere, flagging for LLM fallback")
+        elif status == "unknown_column":
+            print(f"❌ '{col}' not found in masking table")
+
+    return corrections
+
+
+# ---------- Step 4: Handle no-match cases via LLM fallback ----------
+def llm_fallback_correction(no_match_items, masking_table):
+    fallback_results = []
+
+    for item in no_match_items:
+        col   = item["column_name"]
+        value = item["original_value"]
+
+        if col is not None:
+            columns_to_check = [col]
+        else:
+            columns_to_check = COLUMN_FALLBACK_ORDER
+
+        corrected    = None
+        resolved_col = None
+
+        for current_col in columns_to_check:
+            valid_values = masking_table.get(current_col, [])
+            if not valid_values:
+                continue
+
+            print(f"🔎 Checking all {len(valid_values)} values in '{current_col}'")
+
+
+            prompt = f"""
+                The user mentioned "{value}" in their query.
+
+                These are ALL the valid values for column "{current_col}":
+                {valid_values}
+
+                Does any of these CLOSELY match what the user meant? 
+                Only return a match if you are highly confident it is a typo or abbreviation of a valid value.
+                For example "Hydrabad" → "Hyderabad" is a valid correction.
+                But "Sttle" → "South East" is NOT a valid correction as they are not similar at all.
+
+                If nothing closely matches, return null — do not force a match.
+
+                Return ONLY JSON:
+                {{
+                    "corrected_value": "exact value from the list above or null if no good match",
+                    "reason": "brief reason"
+                }}
+            """
+            response = model.invoke(prompt).content
+            print("Response")
+            print(response)
+
+            try:
+                clean     = response.strip().replace("```json", "").replace("```", "")
+                result    = json.loads(clean)
+                corrected = result.get("corrected_value")
+
+                if corrected:
+                    resolved_col = current_col
+                    print(f"✅ LLM confirmed: '{value}' → '{corrected}' in '{resolved_col}' | {result.get('reason')}")
+                    break  # ← Stop as soon as LLM confirms a match
+                else:
+                    print(f"⏭️ LLM rejected all values in '{current_col}', moving to next...")
+
+            except:
+                print(f"⚠️ Failed to parse LLM response for column '{current_col}'")
+                continue
+
+        # After going through all columns
+        if corrected:
+            fallback_results.append({
+                "column_name":     resolved_col,
+                "original_value":  value,
+                "corrected_value": corrected,
+                "status":          "llm_fallback"
+            })
+        else:
+            print(f"❌ '{value}' unresolved after checking all fallback columns")
+            fallback_results.append({
+                "column_name":     col,
+                "original_value":  value,
+                "corrected_value": value,
+                "status":          "unresolved"
+            })
+
+    return fallback_results
+
+import re
+
+# def apply_corrections_to_query(user_query, corrections):
+#     corrected_query = user_query
+
+#     for item in corrections:
+#         original        = item["original_value"]
+#         corrected       = item["corrected_value"]
+#         status          = item["status"]
+#         column_name     = item.get("column_name")
+#         was_column_null = item.get("was_column_null", False)
+
+#         if status in ("case_corrected", "fuzzy_corrected", "llm_fallback") and original != corrected:
+#             # ✅ corrected value always wrapped in quotes
+#             replacement = f'"{corrected}" in "{column_name}"' if was_column_null and column_name else f'"{corrected}"'
+
+#             pattern         = r'\b' + re.escape(original) + r'\b'
+#             corrected_query = re.sub(pattern, replacement, corrected_query, flags=re.IGNORECASE)
+#             print(f"🔁 Replaced '{original}' → '{replacement}'")
+
+#     return corrected_query
+
+def apply_corrections_to_query(user_query, corrections):
+    corrected_query = user_query
+
+    for item in corrections:
+        original    = item["original_value"]
+        corrected   = item["corrected_value"]
+        status      = item["status"]
+        column_name = item.get("column_name")
+
+        if status in ("exact", "case_corrected", "fuzzy_corrected", "llm_fallback"):
+            # ✅ Always append column_name regardless of whether it was null or not
+            replacement     = f'"{corrected}" in "{column_name}"' if column_name else f'"{corrected}"'
+            pattern         = r'\b' + re.escape(original) + r'\b'
+            corrected_query = re.sub(pattern, replacement, corrected_query, flags=re.IGNORECASE)
+            print(f"🔁 Replaced '{original}' → '{replacement}'")
+
+    return corrected_query
+
+# ---------- Master Orchestrator ----------
+def process_user_query(user_query):
+    masking_table = load_masking_table()
+    valid_columns = list(masking_table.keys())
+
+    print(f"\n🔍 Query: {user_query}")
+    print("-" * 50)
+
+    # Step 1 — Extract all entities
+    entities = extract_entities_from_query(user_query, valid_columns)
+    # print("Entities")
+    # print(entities)
+    print(f"📦 Extracted {len(entities)} entities: {entities}\n")
+
+    if not entities:
+        print("No entities found, proceeding with raw query")
+        return user_query
+
+    # Step 2 & 3 — Fuzzy correct all entities
+    corrections = correct_all_entities(entities, masking_table)
+
+    # Step 4 — LLM fallback for unresolved ones
+    no_matches = [c for c in corrections if c["status"] == "no_match"]
+    if no_matches:
+        print(f"\n🔄 Sending {len(no_matches)} unresolved entities to LLM fallback...")
+        fallback = llm_fallback_correction(no_matches, masking_table)
+
+        # ✅ Fix: merge by original_value instead of column_name
+        # column_name can be None so it's not a reliable key
+        fallback_map = {f["original_value"]: f for f in fallback}
+        for c in corrections:
+            if c["status"] == "no_match" and c["original_value"] in fallback_map:
+                c.update(fallback_map[c["original_value"]])
+
+    # Step 5
+    return apply_corrections_to_query(user_query, corrections)
+
 
 def run_snowflake_query(query):
     conn = snowflake.connector.connect(
@@ -46,6 +392,8 @@ def run_snowflake_query(query):
     conn.close()
 
     return df
+
+
 
 def sql_generator_build_rag_examples_block(results):
     if not results:
@@ -132,9 +480,11 @@ def query_decomposer_build_rag_examples_block(results):
 
 
 
-def load_payload_store(payload_path: str) -> Dict[str, Any]:
-    with open(payload_path, "r", encoding="utf-8") as f:
-        return json.load(f)
+
+# ---------- Step 1: LLM extracts ALL entities from query ----------
+
+
+
 
 def get_intent_summary(user_query):
     prompt=f"""
@@ -517,12 +867,15 @@ def build_chatbot(checkpointer):
 
     def chat_node(state: ChatState, config):
         messages = state["messages"]
-        intent=get_intent_summary(messages[-1].content)
-        sql_generator_rag_examples_text, query_decomposer_rag_examples_text, relevant_questions =build_rag_examples(messages[-1].content,intent)
+        query=process_user_query(messages[-1].content)
+        print("Corrected Query") 
+        print(query)
+        intent=get_intent_summary(query)
+        sql_generator_rag_examples_text, query_decomposer_rag_examples_text, relevant_questions =build_rag_examples(query,intent)
 
 
         initial_state = {
-            "question": messages[-1].content,
+            "question": query,
             "messages": messages,
             "run_id": datetime.now(UTC).isoformat() + "Z",
             "last_output": "",
@@ -580,3 +933,4 @@ def build_chatbot(checkpointer):
     graph.add_edge("chat_node", END)
 
     return graph.compile(checkpointer=checkpointer)
+
