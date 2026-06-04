@@ -1719,13 +1719,23 @@ def _build_plotly_figure_json(
     if not raw_code or raw_code.upper() == "NO_VISUALIZATION":
         return None
 
+    logger.info("Visualization code raw:\n%s", raw_code)
+
     rows = sql_result.get("data")
     if not isinstance(rows, list):
         return None
 
-    code = _strip_known_imports(_strip_code_fences(raw_code))
+    code = _strip_code_fences(raw_code)
+    logger.info("Visualization code after fence strip:\n%s", code)
+    code = _strip_known_imports(code)
+    logger.info("Visualization code after import strip:\n%s", code)
     if not code:
         return None
+
+    if "plot_df" in code and "plot_df = df.copy()" not in code:
+        code = "plot_df = df.copy()\n" + code
+
+    logger.info("Visualization code after plot_df inject:\n%s", code)
 
     df = pd.DataFrame(rows)
 
@@ -1799,6 +1809,7 @@ def _build_plotly_figure_json(
     safe_globals: dict[str, Any] = {
         "__builtins__": safe_builtins,
         "df": df,
+        "plot_df": df.copy(),
         "pd": pd,
         "px": px,
         "go": go,
