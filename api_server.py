@@ -113,8 +113,8 @@ DEFAULT_DAILY_PULSE_QUESTIONS: tuple[str, ...] = (
 )
 
 FEEDBACK_ENRICHMENT_MAX_CHARS = 200000
-MAX_FEEDBACK_ENRICH_RETRIES = 3
-FEEDBACK_ENRICH_RETRY_DELAYS_SEC = (10, 30, 60)
+MAX_FEEDBACK_ENRICH_RETRIES = 5
+FEEDBACK_ENRICH_RETRY_DELAYS_SEC = (5, 15, 30, 60, 120)
 
 
 app = FastAPI(title="A360 Backend API", version="0.1.0")
@@ -230,6 +230,14 @@ def _build_db_uri() -> str:
     if host and user and password:
         return f"postgresql://{user}:{password}@{host}:{port}/{database}"
 
+    logger.info(
+        "feedback-enrich pending user=%s thread=%s message=%s attempt=%s",
+        user_id,
+        request.thread_id,
+        request.message_id,
+        attempt_number,
+    )
+
     if TEST_DB_URI_FALLBACK and _env_flag("ALLOW_TEST_DB_FALLBACK", False):
         return TEST_DB_URI_FALLBACK
 
@@ -238,6 +246,23 @@ def _build_db_uri() -> str:
 
 DB_URI = _build_db_uri()
 logger = logging.getLogger(__name__)
+
+
+def _configure_logging() -> None:
+    root_logger = logging.getLogger()
+    level_name = os.getenv("LOG_LEVEL", "INFO").strip().upper()
+    level = getattr(logging, level_name, logging.INFO)
+    logger.setLevel(level)
+    if root_logger.handlers:
+        return
+
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+
+
+_configure_logging()
 
 
 def _get_db_connect_timeout() -> int:
@@ -1829,15 +1854,13 @@ def _build_plotly_figure_json(
         safe_globals["np"] = np
     except Exception:
         pass
-    safe_locals: dict[str, Any] = {}
-
     try:
-        exec(code, safe_globals, safe_locals)
+        exec(code, safe_globals)
     except Exception as exc:
         logger.warning("Visualization code execution failed: %s", exc)
         return None
 
-    fig = safe_locals.get("fig") or safe_globals.get("fig")
+    fig = safe_globals.get("fig")
     if fig is None or not hasattr(fig, "to_plotly_json"):
         return None
 
@@ -2022,6 +2045,9 @@ def _extract_feedback_enrichment_from_cache(
 ) -> dict[str, Optional[str]]:
     cached_messages = _load_cached_messages(thread_id, user_id)
     if not cached_messages:
+        print(
+            f"feedback-enrich cache-empty user={user_id} thread={thread_id} message={message_id}"
+        )
         return {
             "feedback_query_message_id": None,
             "feedback_response_message_id": None,
@@ -2047,6 +2073,9 @@ def _extract_feedback_enrichment_from_cache(
         break
 
     if target_index is None or not isinstance(target_message, dict):
+        print(
+            f"feedback-enrich message-not-found user={user_id} thread={thread_id} message={message_id}"
+        )
         return {
             "feedback_query_message_id": None,
             "feedback_response_message_id": None,
@@ -2133,6 +2162,9 @@ def _validate_feedback_message_ids_against_cache(
 ) -> tuple[bool, Optional[str]]:
     cached_messages = _load_cached_messages(thread_id, user_id)
     if not cached_messages:
+        print(
+            f"feedback-validate cache-miss user={user_id} thread={thread_id} message={message_id}"
+        )
         return False, "Thread message cache is not ready yet"
 
     message_index: dict[str, dict[str, Any]] = {}
@@ -2171,6 +2203,11 @@ def _validate_feedback_message_ids_against_cache(
     for field_name, value, expected_role in checks:
         ok, error = _check_id(field_name, value, expected_role)
         if not ok:
+            print(
+                "feedback-validate failed "
+                f"user={user_id} thread={thread_id} message={message_id} "
+                f"field={field_name} reason={error or 'validation_failed'}"
+            )
             return False, error
 
     return True, None
@@ -2274,12 +2311,10 @@ def _link_feedback_retry_ids_from_stream(
         feedback_response_message_id=feedback_response_message_id,
     )
     if not valid_ids:
-        logger.warning(
-            "feedback-link skipped user=%s thread=%s message=%s reason=%s",
-            user_id,
-            thread_id,
-            anchor_message_id,
-            validation_error or "validation_failed",
+        print(
+            "feedback-link skipped "
+            f"user={user_id} thread={thread_id} message={anchor_message_id} "
+            f"reason={validation_error or 'validation_failed'}"
         )
         return
 
@@ -2314,7 +2349,20 @@ def _enrich_feedback_vote_record(request: VoteRequest, user_id: str) -> bool:
         message_id=request.message_id,
     )
     if not any(enrichment.values()):
+        print(
+            "feedback-enrich skipped "
+            f"user={user_id} thread={request.thread_id} "
+            f"message={request.message_id} reason=no-enrichment"
+        )
         return False
+
+    print(
+        "feedback-enrich start "
+        f"user={user_id} thread={request.thread_id} message={request.message_id} "
+        f"has_user_query={bool(enrichment.get('user_query'))} "
+        f"has_assistant_response={bool(enrichment.get('assistant_response'))} "
+        f"has_sql={bool(enrichment.get('sql_query'))}"
+    )
 
     now_iso = datetime.now(UTC).isoformat()
     _db_execute(
@@ -2348,6 +2396,9 @@ def _enrich_feedback_vote_record(request: VoteRequest, user_id: str) -> bool:
             request.thread_id,
             request.message_id,
         ),
+    )
+    print(
+        f"feedback-enrich done user={user_id} thread={request.thread_id} message={request.message_id}"
     )
     return True
 
@@ -2395,6 +2446,9 @@ def _set_feedback_enrich_state(
 
 
 def _run_feedback_enrichment_with_retries(request: VoteRequest, user_id: str) -> None:
+    print(
+        f"feedback-enrich worker-start user={user_id} thread={request.thread_id} message={request.message_id}"
+    )
     for attempt_index in range(MAX_FEEDBACK_ENRICH_RETRIES):
         attempt_number = attempt_index + 1
         _set_feedback_enrich_state(
@@ -2415,12 +2469,35 @@ def _run_feedback_enrichment_with_retries(request: VoteRequest, user_id: str) ->
                     status="done",
                     attempts=attempt_number,
                 )
+                print(
+                    "feedback-enrich success "
+                    f"user={user_id} thread={request.thread_id} "
+                    f"message={request.message_id} attempt={attempt_number}"
+                )
                 return
-        except Exception:
-            pass
+            print(
+                "feedback-enrich pending "
+                f"user={user_id} thread={request.thread_id} "
+                f"message={request.message_id} attempt={attempt_number}"
+            )
+        except Exception as exc:
+            print(
+                "feedback-enrich error "
+                f"user={user_id} thread={request.thread_id} "
+                f"message={request.message_id} attempt={attempt_number} error={exc}"
+            )
 
-        if attempt_index < len(FEEDBACK_ENRICH_RETRY_DELAYS_SEC):
-            time.sleep(FEEDBACK_ENRICH_RETRY_DELAYS_SEC[attempt_index])
+        if (
+            attempt_index < MAX_FEEDBACK_ENRICH_RETRIES - 1
+            and FEEDBACK_ENRICH_RETRY_DELAYS_SEC
+        ):
+            delay_index = min(
+                attempt_index,
+                len(FEEDBACK_ENRICH_RETRY_DELAYS_SEC) - 1,
+            )
+            base_delay = FEEDBACK_ENRICH_RETRY_DELAYS_SEC[delay_index]
+            jitter = base_delay * 0.2
+            time.sleep(base_delay + random.uniform(0, jitter))
 
     _set_feedback_enrich_state(
         user_id=user_id,
@@ -2428,6 +2505,11 @@ def _run_feedback_enrichment_with_retries(request: VoteRequest, user_id: str) ->
         message_id=request.message_id,
         status="failed_final",
         attempts=MAX_FEEDBACK_ENRICH_RETRIES,
+    )
+    print(
+        "feedback-enrich failed-final "
+        f"user={user_id} thread={request.thread_id} "
+        f"message={request.message_id} attempts={MAX_FEEDBACK_ENRICH_RETRIES}"
     )
 
 
@@ -4552,6 +4634,13 @@ def save_vote(
     if phase not in {"rating_only", "feedback_only", "enrich_only"}:
         raise HTTPException(status_code=400, detail="Invalid vote phase")
 
+    print(
+        "feedback-vote received "
+        f"user={current_user_id} thread={request.thread_id} "
+        f"message={request.message_id} phase={phase} rating={request.rating} "
+        f"has_feedback_text={bool(_normalize_optional_text(request.feedback_text))}"
+    )
+
     if phase == "rating_only":
         if _normalize_optional_text(request.feedback_text):
             raise HTTPException(status_code=400, detail="feedback_text is not allowed for rating_only phase")
@@ -4584,6 +4673,11 @@ def save_vote(
             feedback_response_message_id=normalized_feedback_response_message_id,
         )
         if not valid_ids:
+            print(
+                "feedback-vote rejected "
+                f"user={current_user_id} thread={request.thread_id} "
+                f"message={request.message_id} reason={validation_error or 'validation_failed'}"
+            )
             return JSONResponse(
                 status_code=409,
                 content={
@@ -4595,12 +4689,21 @@ def save_vote(
 
     if phase == "rating_only":
         inserted, updated = _save_feedback_vote(request, current_user_id)
-        if request.rating == 1:
-            background_tasks.add_task(
-                _run_feedback_enrichment_with_retries,
-                request,
-                current_user_id,
-            )
+        print(
+            "feedback-vote stored "
+            f"user={current_user_id} thread={request.thread_id} "
+            f"message={request.message_id} inserted={inserted} updated={updated}"
+        )
+        print(
+            "feedback-enrich scheduled "
+            f"user={current_user_id} thread={request.thread_id} "
+            f"message={request.message_id} phase=rating_only rating={request.rating}"
+        )
+        background_tasks.add_task(
+            _run_feedback_enrichment_with_retries,
+            request,
+            current_user_id,
+        )
         return {
             "success": True,
             "inserted": inserted,
@@ -4610,6 +4713,16 @@ def save_vote(
 
     if phase == "feedback_only":
         inserted, updated = _save_feedback_text(request, current_user_id)
+        print(
+            "feedback-text stored "
+            f"user={current_user_id} thread={request.thread_id} "
+            f"message={request.message_id} inserted={inserted} updated={updated}"
+        )
+        print(
+            "feedback-enrich scheduled "
+            f"user={current_user_id} thread={request.thread_id} "
+            f"message={request.message_id} phase=feedback_only"
+        )
         background_tasks.add_task(
             _run_feedback_enrichment_with_retries,
             request,
@@ -4626,5 +4739,10 @@ def save_vote(
         _run_feedback_enrichment_with_retries,
         request,
         current_user_id,
+    )
+    print(
+        "feedback-enrich scheduled "
+        f"user={current_user_id} thread={request.thread_id} "
+        f"message={request.message_id} phase=enrich_only"
     )
     return {"success": True, "phase": phase, "inserted": False, "updated": True}
