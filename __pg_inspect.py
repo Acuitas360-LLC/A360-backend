@@ -82,7 +82,7 @@ if 'message_feedback' in tables:
     #     LIMIT 1
     # """)
     cur.execute("""
-        SELECT *
+        SELECT feedback_text, enrich_status, enrich_attempts, created_at
         FROM message_feedback
         ORDER BY created_at DESC
         LIMIT 1
@@ -97,5 +97,3 @@ if 'message_feedback' in tables:
             print(f"{col}: {val}")
 
 conn.close()
-
-

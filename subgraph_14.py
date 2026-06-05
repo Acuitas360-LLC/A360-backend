@@ -1379,7 +1379,7 @@ Table: data_867 — transaction-level sales dataset (weekly + campus-level analy
 - campus_id (VARCHAR): unique campus identifier
 - campus_account_name (VARCHAR): campus name
 - campus_account_type (VARCHAR): account type (ACADEMIC, COMMUNITY)
-- campus_tier (VARCHAR): tier (Tier 1, Tier 2, Tier 3, No Tier)
+- campus_tier (VARCHAR): tier (Tier 1, Tier 2, Tier 3, No TIER)
 - campus_city (VARCHAR): campus city
 - campus_state (VARCHAR): campus state
 - campus_zip (VARCHAR): campus ZIP code
@@ -1405,7 +1405,7 @@ Table: data_DDD — competitor + market share dataset (monthly, month-end anchor
 - campus_id (VARCHAR): campus ID
 - campus_account_name (VARCHAR): campus name
 - campus_account_type (VARCHAR): account type (ACADEMIC, COMMUNITY)
-- campus_tier (VARCHAR): tier (Tier 1, Tier 2, Tier 3, No Tier)
+- campus_tier (VARCHAR): tier (Tier 1, Tier 2, Tier 3, No TIER)
 - campus_city (VARCHAR): campus city
 - campus_state (VARCHAR): campus state
 - campus_zip (VARCHAR): campus ZIP
@@ -1427,7 +1427,7 @@ Table: target_campuses — prioritized campuses for strategic focus
 - campus_zip (VARCHAR): ZIP
 - campus_region (VARCHAR): region (Central, Great Lakes, North East, Mid Atlantic, South East)
 - campus_territory (VARCHAR): territory
-- campus_tier (VARCHAR): tier (Tier 1, Tier 2, Tier 3, No Tier)
+- campus_tier (VARCHAR): tier (Tier 1, Tier 2, Tier 3, No TIER)
 - campus_calls (INT): number of calls
 
 Table: calls_data — sales interaction dataset (call-level, time-aligned)
@@ -1443,7 +1443,7 @@ Table: calls_data — sales interaction dataset (call-level, time-aligned)
 - campus_id (VARCHAR): unique campus identifier
 - parent_id (VARCHAR): parent account ID
 - campus_zip (VARCHAR): campus ZIP code
-- campus_tier (VARCHAR): tier (Tier 1, Tier 2, Tier 3, No Tier)
+- campus_tier (VARCHAR): tier (Tier 1, Tier 2, Tier 3, No TIER)
 - campus_territory (VARCHAR): territory name
 - campus_territory_id (VARCHAR): territory ID
 - campus_region_id (VARCHAR): region ID
@@ -1879,7 +1879,7 @@ Table: data_867 — transaction-level sales dataset (weekly + campus-level analy
 - campus_id (VARCHAR): unique campus identifier
 - campus_account_name (VARCHAR): campus name
 - campus_account_type (VARCHAR): account type (ACADEMIC, COMMUNITY)
-- campus_tier (VARCHAR): tier (Tier 1, Tier 2, Tier 3, No Tier)
+- campus_tier (VARCHAR): tier (Tier 1, Tier 2, Tier 3, No TIER)
 - campus_city (VARCHAR): campus city
 - campus_state (VARCHAR): campus state
 - campus_zip (VARCHAR): campus ZIP code
@@ -1905,7 +1905,7 @@ Table: data_DDD — competitor + market share dataset (monthly, month-end anchor
 - campus_id (VARCHAR): campus ID
 - campus_account_name (VARCHAR): campus name
 - campus_account_type (VARCHAR): account type (ACADEMIC, COMMUNITY)
-- campus_tier (VARCHAR): tier (Tier 1, Tier 2, Tier 3, No Tier)
+- campus_tier (VARCHAR): tier (Tier 1, Tier 2, Tier 3, No TIER)
 - campus_city (VARCHAR): campus city
 - campus_state (VARCHAR): campus state
 - campus_zip (VARCHAR): campus ZIP
@@ -1928,7 +1928,7 @@ Table: target_campuses — prioritized campuses for strategic focus
 - campus_zip (VARCHAR): ZIP
 - campus_region (VARCHAR): region (Central, Great Lakes, North East, Mid Atlantic, South East)
 - campus_territory (VARCHAR): territory
-- campus_tier (VARCHAR): tier (Tier 1, Tier 2, Tier 3, No Tier)
+- campus_tier (VARCHAR): tier (Tier 1, Tier 2, Tier 3, No TIER)
 - campus_calls (INT): number of calls
 
 Table: calls_data — sales interaction dataset (call-level, time-aligned)
@@ -1944,7 +1944,7 @@ Table: calls_data — sales interaction dataset (call-level, time-aligned)
 - campus_id (VARCHAR): unique campus identifier
 - parent_id (VARCHAR): parent account ID
 - campus_zip (VARCHAR): campus ZIP code
-- campus_tier (VARCHAR): tier (Tier 1, Tier 2, Tier 3, No Tier)
+- campus_tier (VARCHAR): tier (Tier 1, Tier 2, Tier 3, No TIER)
 - campus_territory (VARCHAR): territory name
 - campus_territory_id (VARCHAR): territory ID
 - campus_region_id (VARCHAR): region ID
@@ -2469,7 +2469,7 @@ Table: data_867 — transaction-level sales dataset (weekly + campus-level analy
 - campus_id (VARCHAR): unique campus identifier
 - campus_account_name (VARCHAR): campus name
 - campus_account_type (VARCHAR): account type (ACADEMIC, COMMUNITY)
-- campus_tier (VARCHAR): tier (Tier 1, Tier 2, Tier 3, No Tier)
+- campus_tier (VARCHAR): tier (Tier 1, Tier 2, Tier 3, No TIER)
 - campus_city (VARCHAR): campus city
 - campus_state (VARCHAR): campus state
 - campus_zip (VARCHAR): campus ZIP code
@@ -2495,7 +2495,7 @@ Table: data_DDD — competitor + market share dataset (monthly, month-end anchor
 - campus_id (VARCHAR): campus ID
 - campus_account_name (VARCHAR): campus name
 - campus_account_type (VARCHAR): account type (ACADEMIC, COMMUNITY)
-- campus_tier (VARCHAR): tier (Tier 1, Tier 2, Tier 3, No Tier)
+- campus_tier (VARCHAR): tier (Tier 1, Tier 2, Tier 3, No TIER)
 - campus_city (VARCHAR): campus city
 - campus_state (VARCHAR): campus state
 - campus_zip (VARCHAR): campus ZIP
@@ -2517,7 +2517,7 @@ Table: target_campuses — prioritized campuses for strategic focus
 - campus_zip (VARCHAR): ZIP
 - campus_region (VARCHAR): region (Central, Great Lakes, North East, Mid Atlantic, South East)
 - campus_territory (VARCHAR): territory
-- campus_tier (VARCHAR): tier (Tier 1, Tier 2, Tier 3, No Tier)
+- campus_tier (VARCHAR): tier (Tier 1, Tier 2, Tier 3, No TIER)
 - campus_calls (INT): number of calls
 
 Table: calls_data — sales interaction dataset (call-level, time-aligned)
@@ -2533,7 +2533,7 @@ Table: calls_data — sales interaction dataset (call-level, time-aligned)
 - campus_id (VARCHAR): unique campus identifier
 - parent_id (VARCHAR): parent account ID
 - campus_zip (VARCHAR): campus ZIP code
-- campus_tier (VARCHAR): tier (Tier 1, Tier 2, Tier 3, No Tier)
+- campus_tier (VARCHAR): tier (Tier 1, Tier 2, Tier 3, No TIER)
 - campus_territory (VARCHAR): territory name
 - campus_territory_id (VARCHAR): territory ID
 - campus_region_id (VARCHAR): region ID
@@ -2686,7 +2686,7 @@ Table: data_867 — transaction-level sales dataset (weekly + campus-level analy
 - campus_id (VARCHAR): unique campus identifier
 - campus_account_name (VARCHAR): campus name
 - campus_account_type (VARCHAR): account type (ACADEMIC, COMMUNITY)
-- campus_tier (VARCHAR): tier (Tier 1, Tier 2, Tier 3, No Tier)
+- campus_tier (VARCHAR): tier (Tier 1, Tier 2, Tier 3, No TIER)
 - campus_city (VARCHAR): campus city
 - campus_state (VARCHAR): campus state
 - campus_zip (VARCHAR): campus ZIP code
@@ -2712,7 +2712,7 @@ Table: data_DDD — competitor + market share dataset (monthly, month-end anchor
 - campus_id (VARCHAR): campus ID
 - campus_account_name (VARCHAR): campus name
 - campus_account_type (VARCHAR): account type (ACADEMIC, COMMUNITY)
-- campus_tier (VARCHAR): tier (Tier 1, Tier 2, Tier 3, No Tier)
+- campus_tier (VARCHAR): tier (Tier 1, Tier 2, Tier 3, No TIER)
 - campus_city (VARCHAR): campus city
 - campus_state (VARCHAR): campus state
 - campus_zip (VARCHAR): campus ZIP
@@ -2734,7 +2734,7 @@ Table: target_campuses — prioritized campuses for strategic focus
 - campus_zip (VARCHAR): ZIP
 - campus_region (VARCHAR): region (Central, Great Lakes, North East, Mid Atlantic, South East)
 - campus_territory (VARCHAR): territory
-- campus_tier (VARCHAR): tier (Tier 1, Tier 2, Tier 3, No Tier)
+- campus_tier (VARCHAR): tier (Tier 1, Tier 2, Tier 3, No TIER)
 - campus_calls (INT): number of calls
 
 Table: calls_data — sales interaction dataset (call-level, time-aligned)
@@ -2750,7 +2750,7 @@ Table: calls_data — sales interaction dataset (call-level, time-aligned)
 - campus_id (VARCHAR): unique campus identifier
 - parent_id (VARCHAR): parent account ID
 - campus_zip (VARCHAR): campus ZIP code
-- campus_tier (VARCHAR): tier (Tier 1, Tier 2, Tier 3, No Tier)
+- campus_tier (VARCHAR): tier (Tier 1, Tier 2, Tier 3, No TIER)
 - campus_territory (VARCHAR): territory name
 - campus_territory_id (VARCHAR): territory ID
 - campus_region_id (VARCHAR): region ID
@@ -2886,6 +2886,19 @@ def sql_executor(state: AgentState):
     result_df = result_df[~result_df.apply(lambda row: row.astype(str).str.strip().eq("UNKOWN").any(), axis=1)]
     result_df = result_df[~result_df.apply(lambda row: row.astype(str).str.strip().eq("Unassigned").any(), axis=1)]
     result_df = result_df[~result_df.apply(lambda row: row.astype(str).str.strip().eq("-").any(), axis=1)]
+    result_df = result_df[~result_df.apply(lambda row: row.astype(str).str.strip().eq("FF99").any(), axis=1)]
+    result_df = result_df[~result_df.apply(lambda row: row.astype(str).str.strip().eq("FF9999").any(), axis=1)]
+    result_df = result_df[
+    ~result_df.apply(
+        lambda row: (
+            row.isna().any() or
+            row.astype(str).str.strip().str.upper().isin(
+                ["NONE", "NULL", "NAN", "<NA>"]
+            ).any()
+        ),
+        axis=1
+    )
+]
     print("Query Result:")
     print(result_df)
     print("Masked DF")
@@ -3454,7 +3467,7 @@ def summarizer_node(state: AgentState):
         - campus_id (VARCHAR): unique campus identifier
         - campus_account_name (VARCHAR): campus name
         - campus_account_type (VARCHAR): account type (ACADEMIC, COMMUNITY)
-        - campus_tier (VARCHAR): tier (Tier 1, Tier 2, Tier 3, No Tier)
+        - campus_tier (VARCHAR): tier (Tier 1, Tier 2, Tier 3, No TIER)
         - campus_city (VARCHAR): campus city
         - campus_state (VARCHAR): campus state
         - campus_zip (VARCHAR): campus ZIP code
@@ -3850,7 +3863,7 @@ Table: data_867 — transaction-level sales dataset (weekly + campus-level analy
 - campus_id (VARCHAR): unique campus identifier
 - campus_account_name (VARCHAR): campus name
 - campus_account_type (VARCHAR): account type (ACADEMIC, COMMUNITY)
-- campus_tier (VARCHAR): tier (Tier 1, Tier 2, Tier 3, No Tier)
+- campus_tier (VARCHAR): tier (Tier 1, Tier 2, Tier 3, No TIER)
 - campus_city (VARCHAR): campus city
 - campus_state (VARCHAR): campus state
 - campus_zip (VARCHAR): campus ZIP code
@@ -3876,7 +3889,7 @@ Table: data_DDD — competitor + market share dataset (monthly, month-end anchor
 - campus_id (VARCHAR): campus ID
 - campus_account_name (VARCHAR): campus name
 - campus_account_type (VARCHAR): account type (ACADEMIC, COMMUNITY)
-- campus_tier (VARCHAR): tier (Tier 1, Tier 2, Tier 3, No Tier)
+- campus_tier (VARCHAR): tier (Tier 1, Tier 2, Tier 3, No TIER)
 - campus_city (VARCHAR): campus city
 - campus_state (VARCHAR): campus state
 - campus_zip (VARCHAR): campus ZIP
@@ -4031,3 +4044,4 @@ if __name__=="__main__":
     # Final result after approval
     print(result)
     append_agent_trace("agent_trace_2.json", user_input, result["trace"])
+
