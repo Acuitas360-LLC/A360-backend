@@ -59,24 +59,30 @@ for t in targets:
 # print('\nLatest message_feedback rows:')
 
 if 'message_feedback' in tables:
+    # cur.execute("""
+    #     SELECT
+    #         id,
+    #         thread_id,
+    #         message_id,
+    #         user_query,
+    #         assistant_response,
+    #         rating,
+    #         created_at,
+    #         user_id,
+    #         feedback_text,
+    #         updated_at,
+    #         enriched_at,
+    #         feedback_query_message_id,
+    #         feedback_response_message_id,
+    #         followup_questions,
+    #         enrich_status,
+    #         enrich_attempts
+    #     FROM message_feedback
+    #     ORDER BY created_at DESC
+    #     LIMIT 1
+    # """)
     cur.execute("""
-        SELECT
-            id,
-            thread_id,
-            message_id,
-            user_query,
-            assistant_response,
-            rating,
-            created_at,
-            user_id,
-            feedback_text,
-            updated_at,
-            enriched_at,
-            feedback_query_message_id,
-            feedback_response_message_id,
-            followup_questions,
-            enrich_status,
-            enrich_attempts
+        SELECT *
         FROM message_feedback
         ORDER BY created_at DESC
         LIMIT 1

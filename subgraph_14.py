@@ -788,8 +788,6 @@ def get_relevant_history(state,recent_messages):
     # print(f"Total Tokens: {total_tokens}")
     return response.content
 
-
-
 def build_messages(state,SYSTEM_PROMPT):
     # print("All Messages")
     # print(state["messages"])
@@ -800,65 +798,171 @@ def build_messages(state,SYSTEM_PROMPT):
     print(get_relevant_context)
     print("-"*100)
     recent_context_prompt=f"""
-────────────────────────
+────────────────────────────────────────────
 CONVERSATION CONTEXT
-────────────────────────
+────────────────────────────────────────────
 
-You will receive two sources of prior context:
+You are provided with TWO context sources derived from the last 3 conversation
+turns. They serve different purposes — use them accordingly.
 
+────────────────────────────────────────────
+SOURCE 1 — EXTRACTED CONTEXT BLOCK (structured JSON)
+────────────────────────────────────────────
 
-* EXTRACTED CONTEXT BLOCK — structured JSON pre-processed from recent turns.
-  Contains resolved entities, periods, filters, metrics, and warnings.
-  Trust this over your own re-parsing of history for IDs, periods, and filters.
+Pre-validated summary of the last 3 turns. This is your PRIMARY source of
+truth for entities, periods, and filters.
 
-────────────────────────
-EXTRACTED CONTEXT BLOCK
-────────────────────────
+  ├── unrelated_to_history   If true, treat this query as fully standalone.
+  │                          Ignore all prior context entirely.
+  │
+  ├── anchored_entities      PRIMARY source for all entity IDs.
+  │                          IDs are verbatim from SQL results — never guess,
+  │                          infer, or fabricate any ID not listed here.
+  │
+  ├── period_context         PRIMARY source for the active time window.
+  │
+  ├── filters_applied        Carry these forward unless explicitly removed.
+  │
+  ├── metric_definitions     Derived from prior SQL logic. Use these —
+  │                          do not assume metric meanings independently.
+  │
+  └── warnings               Surface any that affect query correctness.
 
-Key fields and how to use them:
+────────────────────────────────────────────
+SOURCE 2 — RAW CONVERSATION TURNS (last 3 turns)
+────────────────────────────────────────────
 
-* unrelated_to_history  — If true, treat the query as standalone. Skip all
-                          carry-forward context. Inform the user this question
-                          is unrelated to the prior conversation.
-* anchored_entities     — PRIMARY source for entity IDs. Never generate, guess,
-                          or infer IDs not present here.
-* period_context        — PRIMARY source for the active time window.
-* filters_applied       — Carry these forward unless the user explicitly removes them.
-* warnings              — Surface any that affect query correctness to the user.
+The unprocessed last 3 turns of the conversation. Use this as a SECONDARY
+source only — to recover nuance, exact SQL logic, intermediate results, or
+phrasing that the extracted block may not have captured.
 
-────────────────────────
+  DO use for:
+  ├── Recovering exact SQL from a prior turn if the new query builds on it
+  ├── Reading intermediate result rows not captured in anchored_entities
+  └── Understanding the user's analytical intent from their phrasing
+
+  DO NOT use for:
+  ├── Overriding entity IDs or periods already resolved in Source 1
+  ├── Re-deriving filters or metrics that Source 1 already provides
+  └── Replacing Source 1 when both sources are available
+
+────────────────────────────────────────────
+PRIORITY ORDER
+────────────────────────────────────────────
+
+  Source 1 (Extracted Block) > Source 2 (Raw Turns)
+
+  If they conflict, trust Source 1. Raw turns may contain noise, partial
+  results, or superseded values. The extracted block is the clean resolution.
+
+────────────────────────────────────────────
 RULES
-────────────────────────
+────────────────────────────────────────────
 
-1. Anchor to Extracted Context
-   Use anchored_entities, period_context, and filters_applied as the authoritative
-   structured summary of recent context. Do not re-derive what they already provide.
+1. TRUST SOURCE 1 OVER SOURCE 2
+   Never override anchored_entities, period_context, or filters_applied
+   using raw turn content if Source 1 already resolves them.
 
-3. Preserve Account Continuity
-   Resolve references like "those accounts", "same campuses", "previous accounts" from anchored_entities Never fabricate IDs.
+2. RESOLVE ALL REFERENCES FROM anchored_entities
+   "Those accounts", "same campuses", "them", "above" → IDs from
+   anchored_entities only. If an ID is not there, check raw turns.
+   If not in either source, it does not exist for this query.
 
-4. Reference Resolution
-   Pronouns and relative terms ("those", "same", "above", "them", "these") must
-   resolve to explicit entities from anchored_entities.
+3. NEVER FABRICATE IDs
+   Do not generate, guess, or infer any entity ID not present verbatim
+   in either source.
 
-5. Maintain Analytical Continuity
-   Preserve entities, filters, grouping, and business logic unless the user
-   explicitly changes them. Apply only incremental modifications.
+4. PRESERVE CONTINUITY
+   Maintain entities, filters, grouping, and business logic unless the
+   user explicitly changes them.
 
-7. Trust Data Over Assumptions
-   Prefer SQL results, computed outputs, and explicit values. The extracted
-   context block is pre-validated — trust it over inference.
+5. DO NOT RECOMPUTE WHAT IS ALREADY RESOLVED
+   If Source 1 has the answer, use it. Fall back to Source 2 only for
+   genuinely missing detail.
 
-8. Surface Warnings
-   Flag any extracted context warnings that affect the current query's correctness
-   or interpretation before or alongside your response.
+6. SURFACE WARNINGS FIRST
+   If warnings is non-empty in Source 1, flag relevant ones before
+   proceeding with your response.
+
 
 """
     return [
         SystemMessage(content=SYSTEM_PROMPT),
         SystemMessage(content=recent_context_prompt),
-        *get_relevant_context
+        *get_relevant_context,
+        *recent_messages
     ]
+
+
+# def build_messages(state,SYSTEM_PROMPT):
+#     # print("All Messages")
+#     # print(state["messages"])
+#     #summary_history = history_summarizer(state["messages"])
+#     recent_messages = get_clean_recent_turns(state["messages"])
+#     get_relevant_context=get_relevant_history(state,recent_messages)
+#     print("Relevant Context")
+#     print(get_relevant_context)
+#     print("-"*100)
+#     recent_context_prompt=f"""
+# ────────────────────────
+# CONVERSATION CONTEXT
+# ────────────────────────
+
+# You will receive two sources of prior context:
+
+
+# * EXTRACTED CONTEXT BLOCK — structured JSON pre-processed from recent turns.
+#   Contains resolved entities, periods, filters, metrics, and warnings.
+#   Trust this over your own re-parsing of history for IDs, periods, and filters.
+
+# ────────────────────────
+# EXTRACTED CONTEXT BLOCK
+# ────────────────────────
+
+# Key fields and how to use them:
+
+# * unrelated_to_history  — If true, treat the query as standalone. Skip all
+#                           carry-forward context. Inform the user this question
+#                           is unrelated to the prior conversation.
+# * anchored_entities     — PRIMARY source for entity IDs. Never generate, guess,
+#                           or infer IDs not present here.
+# * period_context        — PRIMARY source for the active time window.
+# * filters_applied       — Carry these forward unless the user explicitly removes them.
+# * warnings              — Surface any that affect query correctness to the user.
+
+# ────────────────────────
+# RULES
+# ────────────────────────
+
+# 1. Anchor to Extracted Context
+#    Use anchored_entities, period_context, and filters_applied as the authoritative
+#    structured summary of recent context. Do not re-derive what they already provide.
+
+# 3. Preserve Account Continuity
+#    Resolve references like "those accounts", "same campuses", "previous accounts" from anchored_entities Never fabricate IDs.
+
+# 4. Reference Resolution
+#    Pronouns and relative terms ("those", "same", "above", "them", "these") must
+#    resolve to explicit entities from anchored_entities.
+
+# 5. Maintain Analytical Continuity
+#    Preserve entities, filters, grouping, and business logic unless the user
+#    explicitly changes them. Apply only incremental modifications.
+
+# 7. Trust Data Over Assumptions
+#    Prefer SQL results, computed outputs, and explicit values. The extracted
+#    context block is pre-validated — trust it over inference.
+
+# 8. Surface Warnings
+#    Flag any extracted context warnings that affect the current query's correctness
+#    or interpretation before or alongside your response.
+
+# """
+#     return [
+#         SystemMessage(content=SYSTEM_PROMPT),
+#         SystemMessage(content=recent_context_prompt),
+#         *get_relevant_context
+#     ]
 
 # def build_messages(state,SYSTEM_PROMPT):
 #     # print("All Messages")
@@ -2780,6 +2884,8 @@ def sql_executor(state: AgentState):
     result_df = run_snowflake_query(sql_generator_output)
     result_df = result_df.dropna(axis=1, how='all')
     result_df = result_df[~result_df.apply(lambda row: row.astype(str).str.strip().eq("UNKOWN").any(), axis=1)]
+    result_df = result_df[~result_df.apply(lambda row: row.astype(str).str.strip().eq("Unassigned").any(), axis=1)]
+    result_df = result_df[~result_df.apply(lambda row: row.astype(str).str.strip().eq("-").any(), axis=1)]
     print("Query Result:")
     print(result_df)
     print("Masked DF")
@@ -3724,7 +3830,13 @@ RULE 12 — MARKET SHARE MUST SHOW PERCENTAGE: Any chart where the user asks for
   df['relmora_share_pct'] = df['relmora_total_mg'] / (df['relmora_total_mg'] + df['zynava_total_mg']) * 100
   If total market volume is unavailable, return NO_VISUALIZATION rather than showing misleading absolute values as market share.  
 
-RULE 13 — ALWAYS INITIALIZE plot_df AFTER IMPORTS: In every visualization, the first executable statement following all import statements must be plot_df = df.copy(). Do not reference plot_df, df, or any derived DataFrame before this initialization line, and never assume df has been renamed or pre-assigned outside the visualization code block.  
+RULE 13 — ALWAYS INITIALIZE FROM df FIRST: The very first executable line of every visualization must be plot_df = df.copy() — never reference plot_df, df, or any derived DataFrame before this line exists, and never assume df has been renamed or pre-assigned outside the visualization code block.
+  
+Rule 14 - Never render reference lines as full-width horizontal dashed lines spanning the entire chart. They collapse into an unreadable stack. Use annotations, markers, or point-specific indicators instead.
+  
+Rule 15 - Never add interpretive commentary, business insights, leadership callouts, or analytical conclusions as text annotations directly on the chart. The chart must contain only: titles, axis labels, legend entries, and data labels. All narrative text belongs outside the visualization.
+  
+Rule 16 - Every chart element — titles, axis labels, tick labels, data labels, legend entries, bars, lines, and annotations — must have sufficient padding and margin so nothing overlaps or crowds another element. Use margin, pad, and standoff in the layout; offset data labels with textposition and textfont; push axis titles away from tick labels using title_standoff. Crowded or overlapping elements are a rendering failure.
   TABLE SCHEMA:
 
 Table: data_867 — transaction-level sales dataset (weekly + campus-level analysis)
@@ -3919,6 +4031,3 @@ if __name__=="__main__":
     # Final result after approval
     print(result)
     append_agent_trace("agent_trace_2.json", user_input, result["trace"])
-
-
-
