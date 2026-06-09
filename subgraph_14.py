@@ -37,7 +37,7 @@ def run_snowflake_query(query):
         account="ua60309.south-central-us.azure",
         warehouse="RELMORA_COMPUTE",
         database="RELMORA_DB",
-        schema="RELMORA_SCHEMA_2"
+        schema="RELMORA_SCHEMA"
     )
 
     cursor = conn.cursor()
@@ -2888,6 +2888,7 @@ def sql_executor(state: AgentState):
     result_df = result_df[~result_df.apply(lambda row: row.astype(str).str.strip().eq("-").any(), axis=1)]
     result_df = result_df[~result_df.apply(lambda row: row.astype(str).str.strip().eq("FF99").any(), axis=1)]
     result_df = result_df[~result_df.apply(lambda row: row.astype(str).str.strip().eq("FF9999").any(), axis=1)]
+    result_df = result_df[~result_df.apply(lambda row: row.astype(str).str.strip().eq("UNKNOWN").any(), axis=1)]
     result_df = result_df[
     ~result_df.apply(
         lambda row: (
@@ -3851,7 +3852,7 @@ Rule 15 - Never add interpretive commentary, business insights, leadership callo
   
 Rule 16 - Every chart element — titles, axis labels, tick labels, data labels, legend entries, bars, lines, and annotations — must have sufficient padding and margin so nothing overlaps or crowds another element. Use margin, pad, and standoff in the layout; offset data labels with textposition and textfont; push axis titles away from tick labels using title_standoff. Crowded or overlapping elements are a rendering failure.
 
-RULE 17 — LEGEND PLACEMENT: Always position the legend below the chart. Use layout.legend=dict(orientation="h", yanchor="top", y=-0.2, xanchor="center", x=0.5) and set layout.margin.b to at least 120px.
+RULE 17 — LEGEND PLACEMENT: Always position the legend below the chart. Use layout.legend=dict(orientation="h", yanchor="top", y=-0.2, xanchor="center", x=0.5) and set layout.margin.b to at least 120px. (VERY IMPORTANT)
 
   TABLE SCHEMA:
 
