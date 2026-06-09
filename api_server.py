@@ -4746,4 +4746,3 @@ def save_vote(
         f"message={request.message_id} phase=enrich_only"
     )
     return {"success": True, "phase": phase, "inserted": False, "updated": True}
-
