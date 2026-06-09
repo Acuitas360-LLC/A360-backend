@@ -3040,7 +3040,7 @@ def summarizer_node(state: AgentState):
         {sql_generator_output}
 
         SQL Executor Output:
-        {masked_df}
+        {result_df}
 
 
         ---
@@ -3502,8 +3502,8 @@ def visualization_node(state: AgentState):
     user_query=state["question"]
     sql_executor_output=state["sql_executor_output"]
     result_df=deserialize_df(sql_executor_output)
-    masked_df=mask_dataframe(result_df)
-    descriptive_stats=get_descriptive_stats(masked_df)
+    #masked_df=mask_dataframe(result_df)
+    descriptive_stats=get_descriptive_stats(result_df)
     print("Descriptive Stats:")
     print(descriptive_stats)
     columns = sql_executor_output["columns"]
@@ -3534,8 +3534,8 @@ Query Decomposer Output:
 SQL Generator Output:
 {sql_generator_output}
  
-SQL Executor Output (masked schema; do not use raw masked column names directly):
-{masked_df}
+SQL Executor Output:
+{result_df}
  
 SQL Executor Output Descriptive Stats:
 {descriptive_stats}
@@ -3850,6 +3850,9 @@ Rule 14 - Never render reference lines as full-width horizontal dashed lines spa
 Rule 15 - Never add interpretive commentary, business insights, leadership callouts, or analytical conclusions as text annotations directly on the chart. The chart must contain only: titles, axis labels, legend entries, and data labels. All narrative text belongs outside the visualization.
   
 Rule 16 - Every chart element — titles, axis labels, tick labels, data labels, legend entries, bars, lines, and annotations — must have sufficient padding and margin so nothing overlaps or crowds another element. Use margin, pad, and standoff in the layout; offset data labels with textposition and textfont; push axis titles away from tick labels using title_standoff. Crowded or overlapping elements are a rendering failure.
+
+RULE 17 — LEGEND PLACEMENT: Always position the legend below the chart. Use layout.legend=dict(orientation="h", yanchor="top", y=-0.2, xanchor="center", x=0.5) and set layout.margin.b to at least 120px.
+
   TABLE SCHEMA:
 
 Table: data_867 — transaction-level sales dataset (weekly + campus-level analysis)
@@ -4044,4 +4047,3 @@ if __name__=="__main__":
     # Final result after approval
     print(result)
     append_agent_trace("agent_trace_2.json", user_input, result["trace"])
-
