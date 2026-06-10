@@ -2883,12 +2883,11 @@ def sql_executor(state: AgentState):
     sql_generator_output=state["sql_generator_output"]
     result_df = run_snowflake_query(sql_generator_output)
     result_df = result_df.dropna(axis=1, how='all')
-    result_df = result_df[~result_df.apply(lambda row: row.astype(str).str.strip().eq("UNKOWN").any(), axis=1)]
+    result_df = result_df[~result_df.apply(lambda row: row.astype(str).str.strip().eq("UNKNOWN").any(), axis=1)]
     result_df = result_df[~result_df.apply(lambda row: row.astype(str).str.strip().eq("Unassigned").any(), axis=1)]
     result_df = result_df[~result_df.apply(lambda row: row.astype(str).str.strip().eq("-").any(), axis=1)]
     result_df = result_df[~result_df.apply(lambda row: row.astype(str).str.strip().eq("FF99").any(), axis=1)]
     result_df = result_df[~result_df.apply(lambda row: row.astype(str).str.strip().eq("FF9999").any(), axis=1)]
-    result_df = result_df[~result_df.apply(lambda row: row.astype(str).str.strip().eq("UNKNOWN").any(), axis=1)]
     result_df = result_df[
     ~result_df.apply(
         lambda row: (
@@ -2902,10 +2901,10 @@ def sql_executor(state: AgentState):
 ]
     print("Query Result:")
     print(result_df)
-    print("Masked DF")
-    load_masking_table_snowflake()
-    masked_df=mask_dataframe(result_df)
-    print(masked_df)
+    # print("Masked DF")
+    # load_masking_table_snowflake()
+    # masked_df=mask_dataframe(result_df)
+    # print(masked_df)
     
 
     serialized_df = {
@@ -3026,7 +3025,7 @@ def summarizer_node(state: AgentState):
     sql_generator_output=state["sql_generator_output"]
     sql_executor_output=state["sql_executor_output"]
     result_df=deserialize_df(sql_executor_output)
-    masked_df=mask_dataframe(result_df)
+    #masked_df=mask_dataframe(result_df)
     prompt=f"""
         You are a senior business analyst presenting analytical findings to an executive audience.
 
@@ -3485,17 +3484,17 @@ def summarizer_node(state: AgentState):
 
     """
     response=model.invoke(prompt).content
-    print("Masked Summary")
+    # print("Masked Summary")
     print(response)
-    summary=demask_string(response)
-    print("Summary")
-    print(summary)
+    # summary=demask_string(response)
+    # print("Summary")
+    # print(summary)
 
 
     
     return {
-        "result_summary":summary,
-        "last_output":summary
+        "result_summary":response,
+        "last_output":response
     }
 
 def visualization_node(state: AgentState):
@@ -3850,9 +3849,22 @@ Rule 14 - Never render reference lines as full-width horizontal dashed lines spa
   
 Rule 15 - Never add interpretive commentary, business insights, leadership callouts, or analytical conclusions as text annotations directly on the chart. The chart must contain only: titles, axis labels, legend entries, and data labels. All narrative text belongs outside the visualization.
   
-Rule 16 - Every chart element — titles, axis labels, tick labels, data labels, legend entries, bars, lines, and annotations — must have sufficient padding and margin so nothing overlaps or crowds another element. Use margin, pad, and standoff in the layout; offset data labels with textposition and textfont; push axis titles away from tick labels using title_standoff. Crowded or overlapping elements are a rendering failure.
+Rule 16 - Every chart element — titles, bars, lines, and annotations — must have sufficient padding and margin so nothing overlaps or crowds another element. Use margin, pad, and standoff in the layout; offset data labels with textposition and textfont; push axis titles away from tick labels using title_standoff. Crowded or overlapping elements are a rendering failure.
 
-RULE 17 — LEGEND PLACEMENT: Always position the legend below the chart. Use layout.legend=dict(orientation="h", yanchor="top", y=-0.2, xanchor="center", x=0.5) and set layout.margin.b to at least 120px. (VERY IMPORTANT)
+RULE 17 — LEGEND PLACEMENT (UPDATED): Always position the legend below the chart, never on the right side. Use:
+        pythonlayout.legend=dict(
+            orientation="h",
+            yanchor="top",
+            y=-0.2,
+            xanchor="center",
+            x=0.5
+        )
+
+        Set layout.margin.b to at least 120px to prevent the bottom legend from being clipped
+        Never use the default Plotly legend placement — always explicitly set orientation="h" to force horizontal layout below the chart
+        Never allow the legend to render on the right side — if it appears there, it means orientation="h" was not set; this is a rendering failure
+RULE 18 — Never hardcode data values as static annotation text. All labels, annotations, and callouts displaying numeric data (sales figures, percentages, counts, etc.) must be dynamically derived from the underlying dataset at render time. Static string literals containing data values (e.g., "1,943,706 MG", "2%") are strictly forbidden
+
 
   TABLE SCHEMA:
 
@@ -3940,16 +3952,16 @@ OR
 
 """
     response=model.invoke(prompt).content
-    visualization_code=demask_string_visualization(response)
-    print("Visualization Code Masked")
-    print("-"*100)
-    print(response)
-    print("Visualization Code Demasked")
-    print("-"*100)
-    print(visualization_code)
+    # visualization_code=demask_string_visualization(response)
+    # print("Visualization Code Masked")
+    # print("-"*100)
+    # print(response)
+    # print("Visualization Code Demasked")
+    # print("-"*100)
+    # print(visualization_code)
     log_trace(state, "visualization_node", "TextMessage", response)
     return {
-        "visualization_code":visualization_code
+        "visualization_code":response
     }
 
 
@@ -4048,3 +4060,6 @@ if __name__=="__main__":
     # Final result after approval
     print(result)
     append_agent_trace("agent_trace_2.json", user_input, result["trace"])
+
+
+
