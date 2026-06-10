@@ -3025,6 +3025,11 @@ def summarizer_node(state: AgentState):
     sql_generator_output=state["sql_generator_output"]
     sql_executor_output=state["sql_executor_output"]
     result_df=deserialize_df(sql_executor_output)
+    print("Deserialized Result DF:")
+    print(result_df)
+    result_json = result_df.to_dict(orient="records")
+    print("Result JSON for Summarizer:")
+    print(result_json)
     #masked_df=mask_dataframe(result_df)
     prompt=f"""
         You are a senior business analyst presenting analytical findings to an executive audience.
@@ -3040,8 +3045,7 @@ def summarizer_node(state: AgentState):
         {sql_generator_output}
 
         SQL Executor Output:
-        {result_df}
-
+        {result_json}
 
         ---
 
@@ -3071,14 +3075,9 @@ def summarizer_node(state: AgentState):
         6. Empty results
         If the result set is empty, clearly state that no activity or records were found, and describe the scope of what was searched (time range, entity type, filters) so the reader understands what the absence means.
 
-        7. Masked identifier consistency
-        The SQL Executor Output contains masked identifiers (e.g., campus_region_2, campus_region_4).
-        Use these masked identifiers exactly as they appear in the data — character-for-character, including underscores, casing, and numbering.
-        Never paraphrase, shorten, or partially reproduce a masked identifier (e.g., do not write "region_4" if the data contains "campus_region_4").
-        Every reference to an entity in the summary must use the full masked identifier as it appears in the results.
-        This is required for downstream processing.
-
-        8. CRITICAL RULE: Always display geography/region names instead of geography or region IDs in visualizations.
+        7. ABSOLUTE DISPLAY RULE — NAMES ONLY, NEVER IDs:Every reference to a campus, territory, or region in the output — in every section, every bullet, and every sentence — MUST use the human-readable name field only: campus_account_name, campus_territory, and campus_region. The corresponding ID fields (campus_id, campus_territory_id, campus_region_id, parent_id, or any other _id field) are strictly forbidden from appearing anywhere in the output. This is non-negotiable and applies to narrative text, comparisons, rankings, and callouts without exception. If the name is not available in the result set, omit the entity entirely — never substitute or display an ID as a fallback.
+        
+        8. COLUMN NAMES ARE NEVER OUTPUT — NUMERIC VALUES ONLY:Every metric in the output — sales, volume, growth, daily average, or any other figure — MUST be the actual resolved numeric value from the SQL Executor Output table. Column names (e.g., relmora_total_mg_r13w, national_relmora_daily_avg_mg_p13w) are strictly forbidden from appearing anywhere in the output.
 
         ---
 
